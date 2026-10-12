@@ -1,0 +1,2537 @@
+openapi: 3.1.0
+info:
+  title: SPPO Applications API
+  description: '
+
+    Прототип REST API для приёма и проверки заявок студентов на материальную поддержку
+    (СППО РУТ (МИИТ)).
+
+
+    **Авторизация:** получите токен через `POST /api/v1/auth/login` (студент — после
+
+    `POST /api/v1/auth/register`, администратор — из `.env`) и передавайте его в заголовке
+
+    `Authorization: Bearer <token>`.
+
+
+    Роли: `student` — свои заявки; `moderator` — очередь и проверка; `admin` — всё
+    плюс пользователи и справочник.
+
+    Ошибки возвращаются в формате `application/problem+json` (RFC 9457).
+
+    '
+  version: 1.0.0
+paths:
+  /health:
+    get:
+      tags:
+      - system
+      summary: 'Liveness: процесс жив'
+      operationId: health_health_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+  /ready:
+    get:
+      tags:
+      - system
+      summary: 'Readiness: доступны MongoDB, Redis и S3'
+      operationId: ready_ready_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+  /api/v1/tasks/{task_id}:
+    get:
+      tags:
+      - tasks
+      summary: Состояние фоновой задачи Celery (PENDING, STARTED, SUCCESS, FAILURE,
+        RETRY)
+      operationId: task_state_api_v1_tasks__task_id__get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: task_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Task Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/auth/register:
+    post:
+      tags:
+      - auth
+      summary: Регистрация студента
+      operationId: register_api_v1_auth_register_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterIn'
+        required: true
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserOut'
+        '409':
+          description: Conflict
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Unprocessable Content
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/auth/login:
+    post:
+      tags:
+      - auth
+      summary: 'Вход: email в поле username, пароль в password (OAuth2 form)'
+      operationId: login_api_v1_auth_login_post
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/Body_login_api_v1_auth_login_post'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPair'
+        '401':
+          description: Unauthorized
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '403':
+          description: Forbidden
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/auth/refresh:
+    post:
+      tags:
+      - auth
+      summary: Обновить пару токенов по refresh-токену
+      operationId: refresh_api_v1_auth_refresh_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshIn'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPair'
+        '401':
+          description: Unauthorized
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '403':
+          description: Forbidden
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/auth/me:
+    get:
+      tags:
+      - auth
+      summary: Текущий пользователь
+      operationId: me_api_v1_auth_me_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserOut'
+        '401':
+          description: Unauthorized
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      security:
+      - OAuth2PasswordBearer: []
+  /api/v1/benefit-types:
+    get:
+      tags:
+      - benefit-types
+      summary: Список оснований и обязательных документов
+      operationId: list_benefit_types_api_v1_benefit_types_get
+      parameters:
+      - name: include_inactive
+        in: query
+        required: false
+        schema:
+          type: boolean
+          default: false
+          title: Include Inactive
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/BenefitTypeOut'
+                title: Response List Benefit Types Api V1 Benefit Types Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/benefit-types/{code}:
+    get:
+      tags:
+      - benefit-types
+      summary: Одно основание
+      operationId: get_benefit_type_api_v1_benefit_types__code__get
+      parameters:
+      - name: code
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Code
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BenefitTypeOut'
+        '404':
+          description: Not Found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/applications:
+    post:
+      tags:
+      - applications
+      summary: Создать заявку (черновик)
+      operationId: create_application_api_v1_applications_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            maxLength: 100
+          - type: 'null'
+          description: Повтор запроса с тем же ключом вернёт ту же заявку
+          title: Idempotency-Key
+        description: Повтор запроса с тем же ключом вернёт ту же заявку
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApplicationCreate'
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplicationOut'
+        '409':
+          description: Conflict
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Unprocessable Content
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    get:
+      tags:
+      - applications
+      summary: Список заявок
+      description: Студент видит только свои заявки; модератор и админ — все, с фильтрами.
+      operationId: list_applications_api_v1_applications_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: status
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - $ref: '#/components/schemas/AppStatus'
+          - type: 'null'
+          title: Status
+      - name: basis
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Basis
+      - name: period
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Period
+      - name: applicant_user_id
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Только для модератора/админа
+          title: Applicant User Id
+        description: Только для модератора/админа
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 100
+          minimum: 1
+          default: 20
+          title: Limit
+      - name: offset
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+          default: 0
+          title: Offset
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_ApplicationSummary_'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/applications/{app_id}:
+    get:
+      tags:
+      - applications
+      summary: Заявка целиком
+      operationId: get_application_api_v1_applications__app_id__get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: app_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: App Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplicationOut'
+        '404':
+          description: Not Found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    patch:
+      tags:
+      - applications
+      summary: Изменить черновик (или заявку, по которой запросили документы)
+      operationId: update_application_api_v1_applications__app_id__patch
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: app_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: App Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApplicationUpdate'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplicationOut'
+        '404':
+          description: Not Found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: Conflict
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Unprocessable Content
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    delete:
+      tags:
+      - applications
+      summary: Удалить черновик
+      operationId: delete_application_api_v1_applications__app_id__delete
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: app_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: App Id
+      responses:
+        '204':
+          description: Successful Response
+        '404':
+          description: Not Found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: Conflict
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/applications/{app_id}/submit:
+    post:
+      tags:
+      - applications
+      summary: Отправить заявку на проверку (асинхронно, через Celery)
+      operationId: submit_application_api_v1_applications__app_id__submit_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: app_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: App Id
+      responses:
+        '202':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubmitOut'
+        '404':
+          description: Not Found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: Conflict
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Unprocessable Content
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '503':
+          description: Service Unavailable
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/applications/{app_id}/status:
+    get:
+      tags:
+      - applications
+      summary: Статус заявки (кэшируется в Redis на несколько секунд)
+      operationId: get_status_api_v1_applications__app_id__status_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: app_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: App Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusOut'
+        '404':
+          description: Not Found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/applications/{app_id}/history:
+    get:
+      tags:
+      - applications
+      summary: История смены статусов
+      operationId: get_history_api_v1_applications__app_id__history_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: app_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: App Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/HistoryItem'
+                title: Response Get History Api V1 Applications  App Id  History Get
+        '404':
+          description: Not Found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/applications/{app_id}/checks:
+    get:
+      tags:
+      - applications
+      summary: Результаты проверок
+      operationId: get_checks_api_v1_applications__app_id__checks_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: app_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: App Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CheckOut'
+                title: Response Get Checks Api V1 Applications  App Id  Checks Get
+        '404':
+          description: Not Found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/applications/{app_id}/attachments:
+    post:
+      tags:
+      - attachments
+      summary: Загрузить скан документа (PDF, JPEG или PNG)
+      operationId: upload_attachment_api_v1_applications__app_id__attachments_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: app_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: App Id
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/Body_upload_attachment_api_v1_applications__app_id__attachments_post'
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttachmentOut'
+        '404':
+          description: Not Found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: Conflict
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '413':
+          description: Payload Too Large
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '415':
+          description: Unsupported Media Type
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Unprocessable Content
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    get:
+      tags:
+      - attachments
+      summary: Список вложений
+      operationId: list_attachments_api_v1_applications__app_id__attachments_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: app_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: App Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AttachmentOut'
+                title: Response List Attachments Api V1 Applications  App Id  Attachments
+                  Get
+        '404':
+          description: Not Found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/applications/{app_id}/attachments/{attachment_id}/download-url:
+    get:
+      tags:
+      - attachments
+      summary: Временная ссылка на скачивание скана (presigned URL)
+      operationId: download_url_api_v1_applications__app_id__attachments__attachment_id__download_url_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: app_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: App Id
+      - name: attachment_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Attachment Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DownloadUrlOut'
+        '404':
+          description: Not Found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/applications/{app_id}/attachments/{attachment_id}:
+    delete:
+      tags:
+      - attachments
+      summary: Удалить вложение
+      operationId: delete_attachment_api_v1_applications__app_id__attachments__attachment_id__delete
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: app_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: App Id
+      - name: attachment_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Attachment Id
+      responses:
+        '204':
+          description: Successful Response
+        '404':
+          description: Not Found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: Conflict
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/moderation/queue:
+    get:
+      tags:
+      - moderation
+      summary: 'Очередь модератора (FIFO: сначала старые заявки)'
+      operationId: moderation_queue_api_v1_moderation_queue_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: status
+        in: query
+        required: false
+        schema:
+          enum:
+          - pending
+          - in_review
+          type: string
+          default: pending
+          title: Status
+      - name: basis
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Basis
+      - name: period
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Period
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 100
+          minimum: 1
+          default: 20
+          title: Limit
+      - name: offset
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+          default: 0
+          title: Offset
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_ApplicationSummary_'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/applications/{app_id}/transitions:
+    post:
+      tags:
+      - moderation
+      summary: Сменить статус заявки (модератор/админ)
+      operationId: transition_api_v1_applications__app_id__transitions_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: app_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: App Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransitionIn'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplicationOut'
+        '404':
+          description: Not Found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: Conflict
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Unprocessable Content
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/applications/{app_id}/checks/{code}:
+    patch:
+      tags:
+      - moderation
+      summary: Ручное решение по проверке (manual_ok / manual_rejected)
+      operationId: decide_check_api_v1_applications__app_id__checks__code__patch
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: app_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: App Id
+      - name: code
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Code
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckDecisionIn'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckOut'
+        '404':
+          description: Not Found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: Conflict
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/admin/users:
+    get:
+      tags:
+      - admin
+      summary: Список пользователей
+      operationId: list_users_api_v1_admin_users_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: role
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - $ref: '#/components/schemas/Role'
+          - type: 'null'
+          title: Role
+      - name: is_active
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Is Active
+      - name: q
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            maxLength: 100
+          - type: 'null'
+          description: Поиск по email или ФИО
+          title: Q
+        description: Поиск по email или ФИО
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 100
+          minimum: 1
+          default: 20
+          title: Limit
+      - name: offset
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+          default: 0
+          title: Offset
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_UserOut_'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    post:
+      tags:
+      - admin
+      summary: Создать пользователя с любой ролью (например, модератора)
+      operationId: create_user_by_admin_api_v1_admin_users_post
+      security:
+      - OAuth2PasswordBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserCreate'
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserOut'
+        '409':
+          description: Conflict
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Unprocessable Content
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/admin/users/{user_id}:
+    get:
+      tags:
+      - admin
+      summary: Пользователь
+      operationId: get_user_api_v1_admin_users__user_id__get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: User Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserOut'
+        '404':
+          description: Not Found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    patch:
+      tags:
+      - admin
+      summary: Сменить роль, заблокировать или переименовать пользователя
+      operationId: update_user_api_v1_admin_users__user_id__patch
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: User Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserUpdate'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserOut'
+        '404':
+          description: Not Found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: Conflict
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Unprocessable Content
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/admin/benefit-types:
+    post:
+      tags:
+      - admin
+      summary: Добавить основание (без миграций схемы)
+      operationId: create_benefit_type_api_v1_admin_benefit_types_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BenefitTypeIn'
+        required: true
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BenefitTypeOut'
+        '409':
+          description: Conflict
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Unprocessable Content
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      security:
+      - OAuth2PasswordBearer: []
+  /api/v1/admin/benefit-types/{code}:
+    put:
+      tags:
+      - admin
+      summary: Изменить основание (сбрасывает кэш справочника)
+      operationId: update_benefit_type_api_v1_admin_benefit_types__code__put
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: code
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Code
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BenefitTypeBase'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BenefitTypeOut'
+        '404':
+          description: Not Found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Unprocessable Content
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    delete:
+      tags:
+      - admin
+      summary: 'Отключить основание (мягкое удаление: старые заявки на него ссылаются)'
+      operationId: disable_benefit_type_api_v1_admin_benefit_types__code__delete
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: code
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Code
+      responses:
+        '204':
+          description: Successful Response
+        '404':
+          description: Not Found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/admin/audit-events:
+    get:
+      tags:
+      - admin
+      summary: Журнал действий сотрудников
+      operationId: list_audit_events_api_v1_admin_audit_events_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: actor_id
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Actor Id
+      - name: action
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Action
+      - name: target_type
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Target Type
+      - name: target_id
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Target Id
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 200
+          minimum: 1
+          default: 50
+          title: Limit
+      - name: offset
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+          default: 0
+          title: Offset
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_AuditEventOut_'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/admin/stats:
+    get:
+      tags:
+      - admin
+      summary: Статистика по заявкам, пользователям и очереди
+      operationId: stats_api_v1_admin_stats_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: period
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Period
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatsOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+components:
+  schemas:
+    AppStatus:
+      type: string
+      enum:
+      - draft
+      - pending
+      - in_review
+      - need_more_docs
+      - approved
+      - rejected
+      title: AppStatus
+    ApplicationCreate:
+      properties:
+        basis:
+          type: string
+          title: Basis
+          examples:
+          - orphan
+        period:
+          anyOf:
+          - type: string
+            pattern: ^\d{4}-(spring|autumn)$
+          - type: 'null'
+          title: Period
+          description: По умолчанию — текущий период из настроек
+          examples:
+          - 2026-autumn
+        student:
+          $ref: '#/components/schemas/StudentIn'
+        payout:
+          $ref: '#/components/schemas/PayoutIn'
+        form:
+          $ref: '#/components/schemas/FormIn'
+          default:
+            applicant_signed: false
+            consent_pd_signed: false
+      additionalProperties: false
+      type: object
+      required:
+      - basis
+      - student
+      - payout
+      title: ApplicationCreate
+    ApplicationOut:
+      properties:
+        id:
+          type: string
+          title: Id
+        applicant_user_id:
+          type: string
+          title: Applicant User Id
+        schema_version:
+          type: integer
+          title: Schema Version
+        period:
+          type: string
+          title: Period
+        basis:
+          type: string
+          title: Basis
+        student:
+          $ref: '#/components/schemas/StudentIn'
+        payout:
+          $ref: '#/components/schemas/PayoutIn'
+        form:
+          $ref: '#/components/schemas/FormIn'
+        attachments:
+          items:
+            $ref: '#/components/schemas/AttachmentOut'
+          type: array
+          title: Attachments
+        checks:
+          items:
+            $ref: '#/components/schemas/CheckOut'
+          type: array
+          title: Checks
+        status:
+          $ref: '#/components/schemas/AppStatus'
+        processing:
+          $ref: '#/components/schemas/ProcessingOut'
+        created_at:
+          type: string
+          format: date-time
+          title: Created At
+        updated_at:
+          type: string
+          format: date-time
+          title: Updated At
+      type: object
+      required:
+      - id
+      - applicant_user_id
+      - schema_version
+      - period
+      - basis
+      - student
+      - payout
+      - form
+      - attachments
+      - checks
+      - status
+      - processing
+      - created_at
+      - updated_at
+      title: ApplicationOut
+    ApplicationSummary:
+      properties:
+        id:
+          type: string
+          title: Id
+        basis:
+          type: string
+          title: Basis
+        period:
+          type: string
+          title: Period
+        status:
+          $ref: '#/components/schemas/AppStatus'
+        student_full_name:
+          type: string
+          title: Student Full Name
+        institute:
+          type: string
+          title: Institute
+        group:
+          type: string
+          title: Group
+        processing_state:
+          $ref: '#/components/schemas/ProcessingState'
+        created_at:
+          type: string
+          format: date-time
+          title: Created At
+        updated_at:
+          type: string
+          format: date-time
+          title: Updated At
+      type: object
+      required:
+      - id
+      - basis
+      - period
+      - status
+      - student_full_name
+      - institute
+      - group
+      - processing_state
+      - created_at
+      - updated_at
+      title: ApplicationSummary
+    ApplicationUpdate:
+      properties:
+        student:
+          anyOf:
+          - $ref: '#/components/schemas/StudentIn'
+          - type: 'null'
+        payout:
+          anyOf:
+          - $ref: '#/components/schemas/PayoutIn'
+          - type: 'null'
+        form:
+          anyOf:
+          - $ref: '#/components/schemas/FormIn'
+          - type: 'null'
+      additionalProperties: false
+      type: object
+      title: ApplicationUpdate
+    AttachmentOut:
+      properties:
+        attachment_id:
+          type: string
+          title: Attachment Id
+        type:
+          type: string
+          title: Type
+        slot:
+          type: string
+          title: Slot
+        content_type:
+          type: string
+          title: Content Type
+        size_bytes:
+          type: integer
+          title: Size Bytes
+        sha256:
+          type: string
+          title: Sha256
+        original_filename:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Original Filename
+        uploaded_at:
+          type: string
+          format: date-time
+          title: Uploaded At
+        ocr_status:
+          type: string
+          title: Ocr Status
+      type: object
+      required:
+      - attachment_id
+      - type
+      - slot
+      - content_type
+      - size_bytes
+      - sha256
+      - uploaded_at
+      - ocr_status
+      title: AttachmentOut
+    AuditEventOut:
+      properties:
+        id:
+          type: string
+          title: Id
+        at:
+          type: string
+          format: date-time
+          title: At
+        actor_id:
+          type: string
+          title: Actor Id
+        actor_email:
+          type: string
+          title: Actor Email
+        actor_role:
+          type: string
+          title: Actor Role
+        action:
+          type: string
+          title: Action
+        target_type:
+          type: string
+          title: Target Type
+        target_id:
+          type: string
+          title: Target Id
+        details:
+          additionalProperties: true
+          type: object
+          title: Details
+      type: object
+      required:
+      - id
+      - at
+      - actor_id
+      - actor_email
+      - actor_role
+      - action
+      - target_type
+      - target_id
+      - details
+      title: AuditEventOut
+    BenefitTypeBase:
+      properties:
+        title:
+          type: string
+          maxLength: 200
+          minLength: 3
+          title: Title
+        form_no:
+          anyOf:
+          - type: integer
+            minimum: 1.0
+          - type: 'null'
+          title: Form No
+        requires:
+          items:
+            $ref: '#/components/schemas/RequiredSlot'
+          type: array
+          title: Requires
+          default: []
+        manual_flags:
+          items:
+            type: string
+          type: array
+          title: Manual Flags
+          default: []
+        is_active:
+          type: boolean
+          title: Is Active
+          default: true
+      additionalProperties: false
+      type: object
+      required:
+      - title
+      title: BenefitTypeBase
+    BenefitTypeIn:
+      properties:
+        title:
+          type: string
+          maxLength: 200
+          minLength: 3
+          title: Title
+        form_no:
+          anyOf:
+          - type: integer
+            minimum: 1.0
+          - type: 'null'
+          title: Form No
+        requires:
+          items:
+            $ref: '#/components/schemas/RequiredSlot'
+          type: array
+          title: Requires
+          default: []
+        manual_flags:
+          items:
+            type: string
+          type: array
+          title: Manual Flags
+          default: []
+        is_active:
+          type: boolean
+          title: Is Active
+          default: true
+        code:
+          type: string
+          pattern: ^[a-z_]{3,64}$
+          title: Code
+          examples:
+          - orphan
+      additionalProperties: false
+      type: object
+      required:
+      - title
+      - code
+      title: BenefitTypeIn
+    BenefitTypeOut:
+      properties:
+        title:
+          type: string
+          maxLength: 200
+          minLength: 3
+          title: Title
+        form_no:
+          anyOf:
+          - type: integer
+            minimum: 1.0
+          - type: 'null'
+          title: Form No
+        requires:
+          items:
+            $ref: '#/components/schemas/RequiredSlot'
+          type: array
+          title: Requires
+          default: []
+        manual_flags:
+          items:
+            type: string
+          type: array
+          title: Manual Flags
+          default: []
+        is_active:
+          type: boolean
+          title: Is Active
+          default: true
+        code:
+          type: string
+          pattern: ^[a-z_]{3,64}$
+          title: Code
+          examples:
+          - orphan
+      additionalProperties: false
+      type: object
+      required:
+      - title
+      - code
+      title: BenefitTypeOut
+    Body_login_api_v1_auth_login_post:
+      properties:
+        grant_type:
+          anyOf:
+          - type: string
+            pattern: ^password$
+          - type: 'null'
+          title: Grant Type
+        username:
+          type: string
+          title: Username
+        password:
+          type: string
+          title: Password
+        scope:
+          type: string
+          title: Scope
+          default: ''
+        client_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Client Id
+        client_secret:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Client Secret
+      type: object
+      required:
+      - username
+      - password
+      title: Body_login_api_v1_auth_login_post
+    Body_upload_attachment_api_v1_applications__app_id__attachments_post:
+      properties:
+        file:
+          type: string
+          format: binary
+          title: File
+        type:
+          type: string
+          enum:
+          - passport_registration
+          - union_card
+          - bank_requisites_screenshot
+          - birth_certificate_student
+          - birth_certificate_child
+          - death_certificate
+          - parental_rights_deprivation
+          - paternity_basis_certificate
+          - missing_person_court_decision
+          - pension_certificate_parents
+          - large_family_certificate
+          - family_composition_certificate
+          - disability_certificate
+          - military_service_certificate
+          - military_id
+          - medical_certificate
+          - chernobyl_certificate
+          - divorce_certificate
+          - grades_extract
+          - other
+          title: Type
+          description: Тип документа из справочника
+      type: object
+      required:
+      - file
+      - type
+      title: Body_upload_attachment_api_v1_applications__app_id__attachments_post
+    CheckDecisionIn:
+      properties:
+        status:
+          type: string
+          enum:
+          - manual_ok
+          - manual_rejected
+          title: Status
+        comment:
+          anyOf:
+          - type: string
+            maxLength: 2000
+          - type: 'null'
+          title: Comment
+      additionalProperties: false
+      type: object
+      required:
+      - status
+      title: CheckDecisionIn
+    CheckOut:
+      properties:
+        code:
+          type: string
+          title: Code
+        kind:
+          type: string
+          enum:
+          - auto
+          - manual
+          title: Kind
+        status:
+          $ref: '#/components/schemas/CheckStatus'
+        score:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Score
+        details:
+          title: Details
+        by:
+          type: string
+          title: By
+        at:
+          type: string
+          format: date-time
+          title: At
+        comment:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Comment
+      type: object
+      required:
+      - code
+      - kind
+      - status
+      - by
+      - at
+      title: CheckOut
+    CheckStatus:
+      type: string
+      enum:
+      - auto_ok
+      - needs_review
+      - mismatch
+      - manual_ok
+      - manual_rejected
+      title: CheckStatus
+    DownloadUrlOut:
+      properties:
+        url:
+          type: string
+          title: Url
+        expires_in:
+          type: integer
+          title: Expires In
+      type: object
+      required:
+      - url
+      - expires_in
+      title: DownloadUrlOut
+    FormIn:
+      properties:
+        applicant_signed:
+          type: boolean
+          title: Applicant Signed
+          default: false
+        signed_date:
+          anyOf:
+          - type: string
+            format: date
+          - type: 'null'
+          title: Signed Date
+        consent_pd_signed:
+          type: boolean
+          title: Consent Pd Signed
+          description: Согласие на обработку ПДн (152-ФЗ)
+          default: false
+        dorm_head_signed:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Dorm Head Signed
+      additionalProperties: false
+      type: object
+      title: FormIn
+    HTTPValidationError:
+      properties:
+        detail:
+          items:
+            $ref: '#/components/schemas/ValidationError'
+          type: array
+          title: Detail
+      type: object
+      title: HTTPValidationError
+    HistoryItem:
+      properties:
+        status:
+          $ref: '#/components/schemas/AppStatus'
+        at:
+          type: string
+          format: date-time
+          title: At
+        by:
+          type: string
+          title: By
+        by_role:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: By Role
+        comment:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Comment
+      type: object
+      required:
+      - status
+      - at
+      - by
+      title: HistoryItem
+    Page_ApplicationSummary_:
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/ApplicationSummary'
+          type: array
+          title: Items
+        total:
+          type: integer
+          title: Total
+        limit:
+          type: integer
+          title: Limit
+        offset:
+          type: integer
+          title: Offset
+      type: object
+      required:
+      - items
+      - total
+      - limit
+      - offset
+      title: Page[ApplicationSummary]
+    Page_AuditEventOut_:
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/AuditEventOut'
+          type: array
+          title: Items
+        total:
+          type: integer
+          title: Total
+        limit:
+          type: integer
+          title: Limit
+        offset:
+          type: integer
+          title: Offset
+      type: object
+      required:
+      - items
+      - total
+      - limit
+      - offset
+      title: Page[AuditEventOut]
+    Page_UserOut_:
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/UserOut'
+          type: array
+          title: Items
+        total:
+          type: integer
+          title: Total
+        limit:
+          type: integer
+          title: Limit
+        offset:
+          type: integer
+          title: Offset
+      type: object
+      required:
+      - items
+      - total
+      - limit
+      - offset
+      title: Page[UserOut]
+    PassportIn:
+      properties:
+        series:
+          type: string
+          pattern: ^\d{4}$
+          title: Series
+        number:
+          type: string
+          pattern: ^\d{6}$
+          title: Number
+        issued_by:
+          anyOf:
+          - type: string
+            maxLength: 300
+          - type: 'null'
+          title: Issued By
+        issued_date:
+          anyOf:
+          - type: string
+            format: date
+          - type: 'null'
+          title: Issued Date
+      additionalProperties: false
+      type: object
+      required:
+      - series
+      - number
+      title: PassportIn
+    PayoutIn:
+      properties:
+        bank:
+          anyOf:
+          - type: string
+            maxLength: 200
+          - type: 'null'
+          title: Bank
+          examples:
+          - ПАО Сбербанк
+        bik:
+          type: string
+          pattern: ^\d{9}$
+          title: Bik
+          examples:
+          - '044525225'
+        account_number:
+          type: string
+          pattern: ^\d{20}$
+          title: Account Number
+      additionalProperties: false
+      type: object
+      required:
+      - bik
+      - account_number
+      title: PayoutIn
+    ProcessingOut:
+      properties:
+        state:
+          $ref: '#/components/schemas/ProcessingState'
+        task_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Task Id
+        updated_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Updated At
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error
+      type: object
+      required:
+      - state
+      title: ProcessingOut
+    ProcessingState:
+      type: string
+      enum:
+      - idle
+      - queued
+      - running
+      - done
+      - failed
+      title: ProcessingState
+    RefreshIn:
+      properties:
+        refresh_token:
+          type: string
+          title: Refresh Token
+      additionalProperties: false
+      type: object
+      required:
+      - refresh_token
+      title: RefreshIn
+    RegisterIn:
+      properties:
+        email:
+          type: string
+          format: email
+          title: Email
+        password:
+          type: string
+          maxLength: 128
+          minLength: 8
+          title: Password
+        full_name:
+          type: string
+          maxLength: 200
+          minLength: 3
+          title: Full Name
+      additionalProperties: false
+      type: object
+      required:
+      - email
+      - password
+      - full_name
+      title: RegisterIn
+    RequiredSlot:
+      properties:
+        slot:
+          type: string
+          pattern: ^[a-z_]{2,40}$
+          title: Slot
+        any_of:
+          items:
+            type: string
+            enum:
+            - passport_registration
+            - union_card
+            - bank_requisites_screenshot
+            - birth_certificate_student
+            - birth_certificate_child
+            - death_certificate
+            - parental_rights_deprivation
+            - paternity_basis_certificate
+            - missing_person_court_decision
+            - pension_certificate_parents
+            - large_family_certificate
+            - family_composition_certificate
+            - disability_certificate
+            - military_service_certificate
+            - military_id
+            - medical_certificate
+            - chernobyl_certificate
+            - divorce_certificate
+            - grades_extract
+            - other
+          type: array
+          minItems: 1
+          title: Any Of
+        note:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Note
+      additionalProperties: false
+      type: object
+      required:
+      - slot
+      - any_of
+      title: RequiredSlot
+    Role:
+      type: string
+      enum:
+      - student
+      - moderator
+      - admin
+      title: Role
+    StatsOut:
+      properties:
+        period:
+          type: string
+          title: Period
+        applications_by_status:
+          additionalProperties:
+            type: integer
+          type: object
+          title: Applications By Status
+        applications_by_basis:
+          additionalProperties:
+            type: integer
+          type: object
+          title: Applications By Basis
+        users_by_role:
+          additionalProperties:
+            type: integer
+          type: object
+          title: Users By Role
+        queue_length:
+          type: integer
+          title: Queue Length
+        max_queue_length:
+          type: integer
+          title: Max Queue Length
+      type: object
+      required:
+      - period
+      - applications_by_status
+      - applications_by_basis
+      - users_by_role
+      - queue_length
+      - max_queue_length
+      title: StatsOut
+    StatusOut:
+      properties:
+        id:
+          type: string
+          title: Id
+        status:
+          $ref: '#/components/schemas/AppStatus'
+        processing:
+          $ref: '#/components/schemas/ProcessingOut'
+        updated_at:
+          type: string
+          format: date-time
+          title: Updated At
+      type: object
+      required:
+      - id
+      - status
+      - processing
+      - updated_at
+      title: StatusOut
+    StudentIn:
+      properties:
+        student_id:
+          anyOf:
+          - type: string
+            maxLength: 50
+          - type: 'null'
+          title: Student Id
+        full_name:
+          type: string
+          maxLength: 200
+          minLength: 5
+          title: Full Name
+          description: ФИО в именительном падеже
+          examples:
+          - Иванов Иван Иванович
+        full_name_as_written:
+          type: string
+          maxLength: 200
+          minLength: 5
+          title: Full Name As Written
+          description: ФИО как в заявлении (родительный падеж)
+          examples:
+          - Иванова Ивана Ивановича
+        birth_date:
+          type: string
+          format: date
+          title: Birth Date
+        institute:
+          type: string
+          maxLength: 100
+          minLength: 2
+          title: Institute
+          examples:
+          - ИУЦТ
+        group:
+          type: string
+          maxLength: 50
+          minLength: 2
+          title: Group
+          examples:
+          - ТКИ-211
+        course:
+          type: integer
+          maximum: 6.0
+          minimum: 1.0
+          title: Course
+        phone:
+          anyOf:
+          - type: string
+            pattern: ^\+?[\d\s\-()]{7,20}$
+          - type: 'null'
+          title: Phone
+        email:
+          anyOf:
+          - type: string
+            format: email
+          - type: 'null'
+          title: Email
+        inn:
+          anyOf:
+          - type: string
+            pattern: ^\d{12}$
+          - type: 'null'
+          title: Inn
+        registration_address:
+          anyOf:
+          - type: string
+            maxLength: 500
+          - type: 'null'
+          title: Registration Address
+        passport:
+          anyOf:
+          - $ref: '#/components/schemas/PassportIn'
+          - type: 'null'
+      additionalProperties: false
+      type: object
+      required:
+      - full_name
+      - full_name_as_written
+      - birth_date
+      - institute
+      - group
+      - course
+      title: StudentIn
+    SubmitOut:
+      properties:
+        id:
+          type: string
+          title: Id
+        status:
+          $ref: '#/components/schemas/AppStatus'
+        task_id:
+          type: string
+          title: Task Id
+        status_url:
+          type: string
+          title: Status Url
+      type: object
+      required:
+      - id
+      - status
+      - task_id
+      - status_url
+      title: SubmitOut
+    TaskOut:
+      properties:
+        task_id:
+          type: string
+          title: Task Id
+        state:
+          type: string
+          title: State
+      type: object
+      required:
+      - task_id
+      - state
+      title: TaskOut
+    TokenPair:
+      properties:
+        access_token:
+          type: string
+          title: Access Token
+        refresh_token:
+          type: string
+          title: Refresh Token
+        token_type:
+          type: string
+          title: Token Type
+          default: bearer
+        expires_in:
+          type: integer
+          title: Expires In
+      type: object
+      required:
+      - access_token
+      - refresh_token
+      - expires_in
+      title: TokenPair
+    TransitionIn:
+      properties:
+        to:
+          $ref: '#/components/schemas/AppStatus'
+        comment:
+          anyOf:
+          - type: string
+            maxLength: 2000
+          - type: 'null'
+          title: Comment
+      additionalProperties: false
+      type: object
+      required:
+      - to
+      title: TransitionIn
+    UserCreate:
+      properties:
+        email:
+          type: string
+          format: email
+          title: Email
+        password:
+          type: string
+          maxLength: 128
+          minLength: 8
+          title: Password
+        full_name:
+          type: string
+          maxLength: 200
+          minLength: 3
+          title: Full Name
+        role:
+          $ref: '#/components/schemas/Role'
+      additionalProperties: false
+      type: object
+      required:
+      - email
+      - password
+      - full_name
+      - role
+      title: UserCreate
+    UserOut:
+      properties:
+        id:
+          type: string
+          title: Id
+        email:
+          type: string
+          title: Email
+        full_name:
+          type: string
+          title: Full Name
+        role:
+          $ref: '#/components/schemas/Role'
+        is_active:
+          type: boolean
+          title: Is Active
+        created_at:
+          type: string
+          format: date-time
+          title: Created At
+      type: object
+      required:
+      - id
+      - email
+      - full_name
+      - role
+      - is_active
+      - created_at
+      title: UserOut
+    UserUpdate:
+      properties:
+        full_name:
+          anyOf:
+          - type: string
+            maxLength: 200
+            minLength: 3
+          - type: 'null'
+          title: Full Name
+        role:
+          anyOf:
+          - $ref: '#/components/schemas/Role'
+          - type: 'null'
+        is_active:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Is Active
+      additionalProperties: false
+      type: object
+      title: UserUpdate
+    ValidationError:
+      properties:
+        loc:
+          items:
+            anyOf:
+            - type: string
+            - type: integer
+          type: array
+          title: Location
+        msg:
+          type: string
+          title: Message
+        type:
+          type: string
+          title: Error Type
+      type: object
+      required:
+      - loc
+      - msg
+      - type
+      title: ValidationError
+    Problem:
+      properties:
+        type:
+          default: about:blank
+          title: Type
+          type: string
+        title:
+          title: Title
+          type: string
+        status:
+          title: Status
+          type: integer
+        detail:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
+          title: Detail
+        instance:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
+          title: Instance
+      required:
+      - title
+      - status
+      title: Problem
+      type: object
+  securitySchemes:
+    OAuth2PasswordBearer:
+      type: oauth2
+      flows:
+        password:
+          scopes: {}
+          tokenUrl: /api/v1/auth/login
+servers:
+- url: http://localhost:8080
+  description: docker compose (nginx)

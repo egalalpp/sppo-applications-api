@@ -1,0 +1,183 @@
+# Запуск всего стека одной командой:  docker compose up -d --build
+# Перед первым запуском: скопируйте .env.example в .env (см. README.md).
+
+name: sppo
+
+# Общие переменные окружения для api, worker, init и flower.
+x-app-env: &app-env
+  ENVIRONMENT: ${ENVIRONMENT:-dev}
+  MONGO_HOST: mongo
+  MONGO_DB: ${MONGO_DB:-sppo}
+  MONGO_APP_USER: ${MONGO_APP_USER:?MONGO_APP_USER is not set, copy .env.example to .env}
+  MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD:?MONGO_APP_PASSWORD is not set}
+  REDIS_HOST: redis
+  REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is not set}
+  JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is not set}
+  S3_ENDPOINT: http://s3:8333
+  S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-http://localhost:8333}
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:?S3_ACCESS_KEY is not set}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:?S3_SECRET_KEY is not set}
+  S3_BUCKET: ${S3_BUCKET:-sppo-docs}
+  CURRENT_PERIOD: ${CURRENT_PERIOD:-2026-autumn}
+  MAX_QUEUE_LENGTH: ${MAX_QUEUE_LENGTH:-50000}
+  OCR_STUB_DELAY_SEC: ${OCR_STUB_DELAY_SEC:-2}
+  CORS_ORIGINS: ${CORS_ORIGINS:-[]}
+  CELERY_BROKER: ${CELERY_BROKER:-}
+
+# Один образ на четыре сервиса: отличаются только командой.
+x-app: &app
+  build:
+    context: ./api
+    target: runtime
+  image: sppo-api:local
+  restart: unless-stopped
+  environment: *app-env
+
+services:
+  # ---------- Данные ----------
+  mongo:
+    image: mongo:8.0
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:?MONGO_ROOT_USER is not set}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?MONGO_ROOT_PASSWORD is not set}
+      # Для init-скрипта, который создаёт пользователя приложения
+      MONGO_DB: ${MONGO_DB:-sppo}
+      MONGO_APP_USER: ${MONGO_APP_USER}
+      MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD}
+    volumes:
+      - mongo-data:/data/db
+      - ./mongo/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    # Порт наружу не публикуется: к базе ходят только сервисы внутри сети compose.
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    # noeviction: в этом же Redis лежит очередь Celery — вытеснять её нельзя.
+    command: ["sh", "-c", "exec redis-server --requirepass \"$$REDIS_PASSWORD\" --appendonly yes --maxmemory-policy noeviction"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # S3-совместимое хранилище сканов (SeaweedFS в режиме «всё в одном процессе»).
+  s3:
+    image: chrislusf/seaweedfs:4.47
+    restart: unless-stopped
+    command:
+      - mini
+      - -s3.port=8333
+      - -s3.encryptVolumeData=true  # файлы на диске хранятся зашифрованными
+      - -webdav=false
+      - -admin.ui=false
+      - -s3.port.iceberg=0
+      - -s3.port.lance=0
+    environment:
+      # Ключи из env становятся единственной admin-учёткой S3; анонимный доступ выключен.
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY}
+    ports:
+      # Только localhost: браузеру нужен S3 для скачивания по presigned-ссылкам.
+      - "127.0.0.1:8333:8333"
+    volumes:
+      - s3-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://127.0.0.1:8333/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  # ---------- Приложение ----------
+  init:
+    <<: *app
+    restart: "no"
+    command: ["python", "-m", "app.bootstrap"]
+    environment:
+      <<: *app-env
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      s3:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    deploy:
+      replicas: ${API_REPLICAS:-2}
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  worker:
+    <<: *app
+    # CELERY_CONCURRENCY — число параллельных обработчиков (c в модели M/M/c/K).
+    command: ["sh", "-c", "exec celery -A app.worker.celery_app:celery_app worker -Q applications --loglevel=INFO --concurrency=$${CELERY_CONCURRENCY}"]
+    environment:
+      <<: *app-env
+      CELERY_CONCURRENCY: ${CELERY_CONCURRENCY:-4}
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.worker.celery_app:celery_app inspect ping -d celery@$$HOSTNAME --timeout 5 | grep -q pong"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 20s
+
+  flower:
+    <<: *app
+    command: ["celery", "-A", "app.worker.celery_app:celery_app", "flower", "--port=5555"]
+    environment:
+      <<: *app-env
+      FLOWER_BASIC_AUTH: ${FLOWER_USER:-admin}:${FLOWER_PASSWORD:?FLOWER_PASSWORD is not set}
+    ports:
+      - "127.0.0.1:5555:5555"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ---------- Вход ----------
+  nginx:
+    image: nginx:1.28.0-alpine
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-8080}:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/proxy_params.conf:/etc/nginx/proxy_params.conf:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/nginx-health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  mongo-data:
+  redis-data:
+  s3-data:

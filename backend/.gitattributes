@@ -1,0 +1,6 @@
+# Всё текстовое — с LF: иначе на Windows скрипты в контейнерах Linux ломаются из-за CRLF.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.pdf binary
