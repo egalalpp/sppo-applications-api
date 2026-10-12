@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.docs import get_redoc_html
 from fastapi.openapi.utils import get_openapi
 
 from app import cache, db, errors
@@ -13,6 +14,8 @@ from app.routers import admin, applications, attachments, auth, benefit_types, m
 from app.schemas import Problem
 
 API_PREFIX = "/api/v1"
+# Версия закреплена: redoc@next, который FastAPI подключает по умолчанию, не грузится в браузере.
+REDOC_JS_URL = "https://cdn.jsdelivr.net/npm/redoc@2.5.0/bundles/redoc.standalone.js"
 
 DESCRIPTION = """
 Прототип REST API для приёма и проверки заявок студентов на материальную поддержку (СППО РУТ (МИИТ)).
@@ -43,6 +46,7 @@ def create_app() -> FastAPI:
         description=DESCRIPTION,
         lifespan=lifespan,
         docs_url=None,
+        redoc_url=None,
     )
 
     if settings.cors_origins:
@@ -67,6 +71,10 @@ def create_app() -> FastAPI:
     app.include_router(system.router)
     for module in (auth, benefit_types, applications, attachments, moderation, admin):
         app.include_router(module.router, prefix=API_PREFIX)
+
+    @app.get("/redoc", include_in_schema=False)
+    async def redoc():
+        return get_redoc_html(openapi_url=app.openapi_url, title=f"{app.title} - ReDoc", redoc_js_url=REDOC_JS_URL)
 
     def custom_openapi():
         if app.openapi_schema:
