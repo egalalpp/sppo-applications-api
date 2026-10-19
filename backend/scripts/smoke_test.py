@@ -1,10 +1,17 @@
-"""Сквозная проверка запущенного стека: полный путь заявки от студента до одобрения.
+"""Сквозная проверка запущенного стека. Нужен только Python 3.10+ (без сторонних библиотек).
 
-Нужен только Python 3.10+ (без сторонних библиотек). Запуск после `docker compose up -d --build`:
     python scripts/smoke_test.py
-    python scripts/smoke_test.py --base-url http://localhost:8080
+    python scripts/smoke_test.py --base-url http://localhost:8000 --mailpit-url http://localhost:8025
 
-Учётка администратора берётся из .env (ADMIN_EMAIL / ADMIN_PASSWORD).
+Сценарий A: студент подаёт заявку со сканами, воркер распознаёт их Tesseract'ом, оператор
+разбирает проверки и одобряет; студент получает письма «принята» и «одобрена».
+Сценарий B: одно вложение не читается (сбой OCR) — заявка всё равно открывается у оператора,
+распознавание можно перезапустить, оператор отклоняет заявку с причиной.
+Всё время проверяется, что студент не видит ничего, связанного с распознаванием.
+
+Файлы для загрузки — учебные образцы с вымышленными данными из scripts/fixtures
+(создаются скриптом make_fixtures.py). Письма читаются из Mailpit; если он недоступен,
+проверки почты пропускаются.
 """
 
 import argparse
@@ -18,12 +25,16 @@ import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
-# Минимальные файлы: тип определяется сервером по сигнатуре. Хвост уникален для каждого
-# запуска, иначе повторные прогоны поймают проверку дублей (одинаковый sha256).
-RUN = uuid.uuid4().bytes
-PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64 + RUN
-PDF = b"%PDF-1.4\n%smoke\n" + RUN
+# Должны совпадать с тем, что нарисовано на образцах (scripts/make_fixtures.py)
+BIK = "044525225"
+ACCOUNT = "40817810700000000001"
+RUN = uuid.uuid4().bytes  # хвост после PNG-данных: у каждого запуска свой sha256, иначе сработает проверка дублей
+
+# Всё, что относится к распознаванию: студенту такие поля показывать нельзя
+OCR_KEYS = {"ocr", "checks", "processing", "accuracy", "ocr_state", "ocr_accuracy", "confidence",
+            "text_preview", "seal", "signature", "engine", "task_id", "notes"}
 
 
 class Api:
@@ -31,7 +42,6 @@ class Api:
         self.base = base_url.rstrip("/")
 
     def call(self, method, path, *, token=None, json_body=None, form=None, files=None, headers=None, expect=None):
-        url = self.base + path
         hdrs = dict(headers or {})
         data = None
         if token:
@@ -45,16 +55,22 @@ class Api:
         elif files is not None:
             data, content_type = _multipart(form or {}, files)
             hdrs["Content-Type"] = content_type
-        req = urllib.request.Request(url, data=data, method=method, headers=hdrs)
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                status, body, rh = resp.status, resp.read(), resp.headers
-        except urllib.error.HTTPError as err:
-            status, body, rh = err.code, err.read(), err.headers
-        parsed = json.loads(body) if body and "json" in (rh.get("Content-Type") or "") else body
+        for attempt in range(8):
+            request = urllib.request.Request(self.base + path, data=data, method=method, headers=hdrs)
+            try:
+                with urllib.request.urlopen(request, timeout=30) as resp:
+                    status, body, response_headers = resp.status, resp.read(), resp.headers
+            except urllib.error.HTTPError as err:
+                status, body, response_headers = err.code, err.read(), err.headers
+            if status != 429:
+                break
+            # Лимит nginx на вход и регистрацию — 10 запросов в минуту: ждём, а не падаем
+            note(f"nginx ограничивает частоту запросов (429) на {path}, жду 7 с")
+            time.sleep(7)
+        parsed = json.loads(body) if body and "json" in (response_headers.get("Content-Type") or "") else body
         if expect is not None and status != expect:
             fail(f"{method} {path}: ожидали {expect}, получили {status}: {parsed}")
-        return status, parsed, rh
+        return status, parsed, response_headers
 
 
 def _multipart(fields: dict, files: dict) -> tuple[bytes, str]:
@@ -80,6 +96,10 @@ def ok(message: str):
     print(f"[ OK ] {message}")
 
 
+def note(message: str):
+    print(f"[ -- ] {message}")
+
+
 def read_env() -> dict:
     env = {}
     path = ROOT / ".env"
@@ -88,7 +108,7 @@ def read_env() -> dict:
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 key, value = line.split("=", 1)
-                env[key.strip()] = value.strip()
+                env[key.strip()] = value.strip().strip('"')
     return env
 
 
@@ -99,14 +119,21 @@ def valid_inn() -> str:
     return "".join(map(str, d))
 
 
-def valid_account(bik: str) -> str:
-    base = "4081781000" + f"{uuid.uuid4().int % 10**9:09d}"  # 19 цифр, 9-я позиция — ключ
-    for key in "0123456789":
-        acc = base[:8] + key + base[8:]
-        digits = bik[-3:] + acc
-        if sum(int(c) * w % 10 for c, w in zip(digits, [7, 1, 3] * 8)) % 10 == 0:
-            return acc
-    raise RuntimeError("unreachable")
+def fixture(name: str, unique: str = "") -> bytes:
+    return (FIXTURES / name).read_bytes() + RUN + unique.encode()  # хвост после IEND декодеры игнорируют
+
+
+def assert_student_blind(value, where: str):
+    """В ответе студенту нет ни одного ключа, связанного с распознаванием и проверками."""
+    if isinstance(value, dict):
+        leaked = OCR_KEYS & set(value)
+        if leaked:
+            fail(f"{where}: студент видит {sorted(leaked)}")
+        for item in value.values():
+            assert_student_blind(item, where)
+    elif isinstance(value, list):
+        for item in value:
+            assert_student_blind(item, where)
 
 
 def login(api: Api, email: str, password: str) -> str:
@@ -114,20 +141,81 @@ def login(api: Api, email: str, password: str) -> str:
     return body["access_token"]
 
 
+def new_student(api: Api, label: str) -> tuple[str, str]:
+    email = f"{label}-{uuid.uuid4().hex[:8]}@example.com"
+    api.call("POST", "/api/v1/auth/register", json_body={
+        "email": email, "password": "student-pass-123", "full_name": "Ivanov Ivan"}, expect=201)
+    return email, login(api, email, "student-pass-123")
+
+
+def application_body(basis: str, email: str, **payout) -> dict:
+    return {
+        "basis": basis,
+        "student": {
+            "full_name": "Иванов Иван Иванович", "birth_date": "2005-03-14", "institute": "ИУЦТ",
+            "group": "ТКИ-211", "course": 3, "email": email, "inn": valid_inn(),
+            "passport": {"series": "4510", "number": "123456"},
+        },
+        "payout": {"bank": "ПАО Сбербанк", "bik": BIK, "account_number": ACCOUNT, **payout},
+        "form": {"applicant_signed": True, "consent_pd_signed": True},
+    }
+
+
+def upload(api, token, app_id, doc_type, content, filename, ctype="image/png", expect=201):
+    return api.call("POST", f"/api/v1/applications/{app_id}/attachments", token=token, form={"type": doc_type},
+                    files={"file": (filename, content, ctype)}, expect=expect)
+
+
+def wait_ocr(api, token, app_id, states, timeout=180):
+    deadline = time.time() + timeout
+    while True:
+        _, st, _ = api.call("GET", f"/api/v1/applications/{app_id}/status", token=token, expect=200)
+        if st["ocr"]["state"] in states:
+            return st
+        if time.time() > deadline:
+            fail(f"распознавание не завершилось за {timeout} с: {st}")
+        time.sleep(2)
+
+
+class Mailbox:
+    """Письма из Mailpit (REST API). Если Mailpit недоступен, проверки почты пропускаются."""
+
+    def __init__(self, url: str):
+        self.url = url.rstrip("/")
+        try:
+            urllib.request.urlopen(f"{self.url}/api/v1/info", timeout=3).read()
+            self.available = True
+        except OSError:
+            self.available = False
+
+    def _get(self, path: str):
+        with urllib.request.urlopen(self.url + path, timeout=10) as resp:
+            return json.loads(resp.read())
+
+    def wait_for(self, to: str, subject_part: str, timeout=60):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            query = urllib.parse.quote(f'to:"{to}"')
+            for message in self._get(f"/api/v1/search?query={query}").get("messages", []):
+                if subject_part in message["Subject"]:
+                    return self._get(f"/api/v1/message/{message['ID']}")
+            time.sleep(2)
+        fail(f"письмо «{subject_part}» для {to} не пришло за {timeout} с")
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base-url", default="http://localhost:8080")
-    args = parser.parse_args()
-    api = Api(args.base_url)
     env = read_env()
+    parser.add_argument("--base-url", default=f"http://localhost:{env.get('HTTP_PORT', '8000')}")
+    parser.add_argument("--mailpit-url", default="http://localhost:8025")
+    args = parser.parse_args()
+    api, mailbox = Api(args.base_url), Mailbox(args.mailpit_url)
 
-    # 1. Балансировка
+    # ---------- Инфраструктура ----------
     instances = {api.call("GET", "/health", expect=200)[2].get("X-Instance") for _ in range(6)}
     ok(f"nginx -> реплики api: {sorted(instances)}")
     _, ready, _ = api.call("GET", "/ready", expect=200)
     ok(f"/ready: {ready['checks']}")
-
-    # 2. Кэш справочника
     api.call("GET", "/api/v1/benefit-types", expect=200)
     _, types, h = api.call("GET", "/api/v1/benefit-types", expect=200)
     ok(f"справочник: {len(types)} оснований, X-Cache={h.get('X-Cache')}")
@@ -135,118 +223,221 @@ def main():
     if status != 304:
         fail(f"ETag: ожидали 304, получили {status}")
     ok("ETag/If-None-Match -> 304 Not Modified")
+    if not mailbox.available:
+        note("Mailpit недоступен: проверки писем пропущены (SMTP_HOST/Brevo — настоящая почта)")
 
-    # 3. Студент
-    email = f"student-{uuid.uuid4().hex[:8]}@example.com"
-    password = "student-pass-123"
-    api.call("POST", "/api/v1/auth/register", json_body={"email": email, "password": password,
-                                                         "full_name": "Иванов Иван Иванович"}, expect=201)
-    student = login(api, email, password)
-    ok(f"студент зарегистрирован и вошёл: {email}")
+    # ---------- Администратор и оператор ----------
+    demo = env.get("SEED_DEMO_USERS", "false").lower() == "true"
+    admin_email, admin_password = ("admin@rut.ru", "admin123") if demo else (env.get("ADMIN_EMAIL"), env.get("ADMIN_PASSWORD"))
+    if not admin_email or not admin_password:
+        fail("нет учётки администратора: SEED_DEMO_USERS=true или ADMIN_EMAIL/ADMIN_PASSWORD в .env")
+    admin = login(api, admin_email, admin_password)
+    ok(f"вошёл администратор {admin_email}")
+    if demo:
+        login(api, "student@rut.ru", "student123")
+        login(api, "operator@rut.ru", "operator123")
+        ok("демо-учётки student@rut.ru и operator@rut.ru работают")
+    op_email = f"operator-{uuid.uuid4().hex[:8]}@example.com"
+    _, op_user, _ = api.call("POST", "/api/v1/admin/users", token=admin, json_body={
+        "email": op_email, "password": "operator-pass-123", "full_name": "Петрова Мария", "role": "operator"}, expect=201)
+    if op_user["role"] != "operator":
+        fail(f"роль {op_user['role']}")
+    api.call("POST", "/api/v1/admin/users", token=admin, json_body={
+        "email": f"old-{uuid.uuid4().hex[:6]}@example.com", "password": "moderator-pass-1", "full_name": "Старая Роль",
+        "role": "moderator"}, expect=422)
+    operator = login(api, op_email, "operator-pass-123")
+    ok(f"админ создал оператора {op_email}; роли moderator больше нет")
 
-    status, _, _ = api.call("GET", "/api/v1/admin/users", token=student)
-    if status != 403:
-        fail(f"студент получил доступ к админке: {status}")
-    ok("студент -> /admin/users: 403")
+    # ======================= Сценарий A =======================
+    print("\n--- Сценарий A: заявка проходит распознавание и одобряется ---")
+    email, student = new_student(api, "student-a")
+    for path in ("/api/v1/operator/queue", "/api/v1/admin/users"):
+        status, _, _ = api.call("GET", path, token=student)
+        if status != 403:
+            fail(f"студент получил доступ к {path}: {status}")
+    ok("студент -> /operator/queue и /admin/users: 403")
 
-    # 4. Заявка (с Idempotency-Key)
-    bik = "044525225"
-    application = {
-        "basis": "orphan",
-        "student": {
-            "full_name": "Иванов Иван Иванович",
-            "full_name_as_written": "Иванова Ивана Ивановича",
-            "birth_date": "2005-03-14", "institute": "ИУЦТ", "group": "ТКИ-211", "course": 3,
-            "inn": valid_inn(), "passport": {"series": "4510", "number": "123456"},
-        },
-        "payout": {"bank": "ПАО Сбербанк", "bik": bik, "account_number": valid_account(bik)},
-        "form": {"applicant_signed": True, "consent_pd_signed": True},
-    }
+    body = application_body("orphan", email)
     key = {"Idempotency-Key": uuid.uuid4().hex}
-    _, app, _ = api.call("POST", "/api/v1/applications", token=student, json_body=application, headers=key, expect=201)
-    _, again, _ = api.call("POST", "/api/v1/applications", token=student, json_body=application, headers=key, expect=200)
+    _, app, _ = api.call("POST", "/api/v1/applications", token=student, json_body=body, headers=key, expect=201)
+    _, again, _ = api.call("POST", "/api/v1/applications", token=student, json_body=body, headers=key, expect=200)
     if again["id"] != app["id"]:
         fail("Idempotency-Key не сработал")
     app_id = app["id"]
-    ok(f"заявка создана: {app_id} (повтор с тем же Idempotency-Key вернул её же)")
+    assert_student_blind(app, "создание заявки")
+    ok(f"заявка создана: {app_id}")
 
-    # 5. Вложения
-    for doc_type in ("passport_registration", "union_card", "bank_requisites_screenshot",
-                     "birth_certificate_student", "death_certificate"):
-        content = PDF + doc_type.encode() if doc_type == "death_certificate" else PNG + doc_type.encode()
-        name, ctype = ("doc.pdf", "application/pdf") if content.startswith(b"%PDF") else ("doc.png", "image/png")
-        api.call("POST", f"/api/v1/applications/{app_id}/attachments", token=student,
-                 form={"type": doc_type}, files={"file": (name, content, ctype)}, expect=201)
-    ok("загружено 5 вложений")
-    status, _, _ = api.call("POST", f"/api/v1/applications/{app_id}/attachments", token=student,
-                            form={"type": "other"}, files={"file": ("x.exe", b"MZ\x90\x00", "image/png")})
-    if status != 415:
-        fail(f"exe под видом png: ожидали 415, получили {status}")
-    ok("файл с чужой сигнатурой отклонён: 415")
+    status, err, _ = api.call("POST", f"/api/v1/applications/{app_id}/submit", token=student)
+    if status != 422 or "missing_slots" not in err:
+        fail(f"отправка без документов: ожидали 422 со списком, получили {status}: {err}")
+    ok(f"без обязательных документов отправить нельзя: не хватает {err['missing_slots']}")
 
-    _, att_list, _ = api.call("GET", f"/api/v1/applications/{app_id}/attachments", token=student, expect=200)
-    _, link, _ = api.call("GET", f"/api/v1/applications/{app_id}/attachments/{att_list[0]['attachment_id']}"
+    status, _, _ = api.call("POST", "/api/v1/applications", token=student, json_body=body)
+    if status != 409:
+        fail(f"вторая заявка по тому же основанию: ожидали 409, получили {status}")
+    ok("вторая заявка по тому же основанию в периоде: 409")
+
+    docs = [
+        ("passport_registration", "passport.png"), ("union_card", "certificate.png"),
+        ("bank_requisites_screenshot", "bank.png"), ("birth_certificate_student", "certificate.png"),
+        ("death_certificate", "certificate.png"),
+    ]
+    for doc_type, name in docs:
+        upload(api, student, app_id, doc_type, fixture(name, doc_type), name)
+    upload(api, student, app_id, "other", b"MZ\x90\x00 exe", "x.png", expect=415)
+    ok("загружено 5 вложений; файл с чужой сигнатурой отклонён: 415")
+
+    _, attachments, _ = api.call("GET", f"/api/v1/applications/{app_id}/attachments", token=student, expect=200)
+    assert_student_blind(attachments, "список вложений")
+    _, link, _ = api.call("GET", f"/api/v1/applications/{app_id}/attachments/{attachments[0]['attachment_id']}"
                                  "/download-url", token=student, expect=200)
     with urllib.request.urlopen(link["url"], timeout=10) as resp:
         if resp.status != 200:
             fail("presigned URL не открылся")
     ok("presigned URL на скачивание работает")
 
-    # 6. Отправка и ожидание Celery
-    _, submitted, _ = api.call("POST", f"/api/v1/applications/{app_id}/submit", token=student, expect=202)
-    ok(f"отправлено, task_id={submitted['task_id']}")
-    deadline = time.time() + 120
-    while True:
-        _, st, h = api.call("GET", f"/api/v1/applications/{app_id}/status", token=student, expect=200)
-        if st["processing"]["state"] == "done":
-            break
-        if st["processing"]["state"] == "failed" or time.time() > deadline:
-            fail(f"обработка не завершилась: {st}")
-        time.sleep(2)
-    ok("воркер Celery обработал заявку")
-    _, checks, _ = api.call("GET", f"/api/v1/applications/{app_id}/checks", token=student, expect=200)
-    for c in checks:
-        print(f"         {c['code']:<28} {c['status']:<13} {c.get('score') or ''}")
+    status, submitted, _ = api.call("POST", f"/api/v1/applications/{app_id}/submit", token=student)
+    if status != 202 or set(submitted) != {"id", "status"} or submitted["status"] != "pending":
+        fail(f"отправка: {status} {submitted}")
+    ok("отправлено: ответ студенту — только id и status")
 
-    # 7. Админ создаёт модератора
-    admin_email, admin_password = env.get("ADMIN_EMAIL"), env.get("ADMIN_PASSWORD")
-    if not admin_email or not admin_password:
-        fail("в .env нет ADMIN_EMAIL / ADMIN_PASSWORD")
-    admin = login(api, admin_email, admin_password)
-    mod_email = f"moderator-{uuid.uuid4().hex[:8]}@example.com"
-    api.call("POST", "/api/v1/admin/users", token=admin, json_body={
-        "email": mod_email, "password": "moderator-pass-123", "full_name": "Петров Пётр", "role": "moderator",
-    }, expect=201)
-    moderator = login(api, mod_email, "moderator-pass-123")
-    ok(f"админ создал модератора {mod_email}")
+    st = wait_ocr(api, operator, app_id, {"ready_for_review", "ocr_failed"})
+    if st["ocr"]["state"] != "ready_for_review":
+        fail(f"распознавание завершилось с ошибкой: {st}")
+    ok(f"воркер распознал заявку Tesseract'ом: ocr.state={st['ocr']['state']}, точность {st['ocr']['accuracy']}%")
 
-    # 8. Модерация
-    _, queue, _ = api.call("GET", "/api/v1/moderation/queue?limit=100", token=moderator, expect=200)
-    ok(f"в очереди модератора заявок: {queue['total']}")
-    api.call("POST", f"/api/v1/applications/{app_id}/transitions", token=moderator,
-             json_body={"to": "in_review"}, expect=200)
-    status, body, _ = api.call("POST", f"/api/v1/applications/{app_id}/transitions", token=moderator,
-                               json_body={"to": "approved"})
+    # --- студент ничего не знает про распознавание ---
+    _, s_app, _ = api.call("GET", f"/api/v1/applications/{app_id}", token=student, expect=200)
+    _, s_status, _ = api.call("GET", f"/api/v1/applications/{app_id}/status", token=student, expect=200)
+    _, s_list, _ = api.call("GET", "/api/v1/applications", token=student, expect=200)
+    _, s_hist, _ = api.call("GET", f"/api/v1/applications/{app_id}/history", token=student, expect=200)
+    for name, payload in (("заявка", s_app), ("статус", s_status), ("список", s_list), ("история", s_hist)):
+        assert_student_blind(payload, name)
+    for method, path in (("GET", f"/api/v1/applications/{app_id}/checks"),
+                         ("POST", f"/api/v1/applications/{app_id}/ocr/restart"),
+                         ("GET", f"/api/v1/tasks/{st['ocr'].get('task_id') or 'x'}")):
+        status, _, _ = api.call(method, path, token=student)
+        if status != 403:
+            fail(f"студенту доступно {method} {path}: {status}")
+    ok("студент не видит OCR, проверки и задачи: ответы без этих полей, /checks, /ocr/restart, /tasks — 403")
+    if any("by" in h for h in s_hist):
+        fail("студент видит id сотрудников в истории")
+
+    if mailbox.available:
+        letter = mailbox.wait_for(email, "принята")
+        for word in ("ocr", "распознав", "tesseract"):
+            if word in letter["Text"].lower():
+                fail(f"в письме студенту есть «{word}»")
+        ok(f"письмо «{letter['Subject']}» пришло в Mailpit")
+
+    # --- оператор ---
+    _, queue, _ = api.call("GET", "/api/v1/operator/queue?ocr_state=ready_for_review&limit=100", token=operator, expect=200)
+    mine = next((i for i in queue["items"] if i["id"] == app_id), None)
+    if not mine or mine["ocr_accuracy"] is None:
+        fail(f"заявки нет в очереди оператора с ocr_state и точностью: {mine}")
+    ok(f"очередь оператора: ocr_state={mine['ocr_state']}, ocr_accuracy={mine['ocr_accuracy']}%")
+    _, op_app, _ = api.call("GET", f"/api/v1/applications/{app_id}", token=operator, expect=200)
+    by_code = {c["code"]: c for c in op_app["checks"]}
+    expected = ("fio_form_vs_passport", "passport_number_vs_scan", "bank_requisites_vs_scan", "bank_owner_confirmed",
+                "inn_checksum", "bank_account_checksum")
+    bad = {c: by_code[c]["status"] for c in expected if by_code[c]["status"] != "auto_ok"}
+    if bad:
+        fail(f"автопроверки по сканам не сошлись: {bad}")
+    ok("автопроверки по сканам: ФИО, серия/номер паспорта, БИК и счёт, владелец счёта — auto_ok")
+    passport_ocr = next(a["ocr"] for a in op_app["attachments"] if a["type"] == "passport_registration")
+    cert_ocr = next(a["ocr"] for a in op_app["attachments"] if a["type"] == "union_card")
+    if passport_ocr["engine"] != "tesseract" or not passport_ocr.get("confidence"):
+        fail(f"паспорт: {passport_ocr}")
+    if "есть печать" not in cert_ocr["notes"] or "есть подпись" not in cert_ocr["notes"]:
+        fail(f"справка: ожидали «есть печать» и «есть подпись», получили {cert_ocr['notes']}")
+    ok(f"оператор видит результат по вложениям: паспорт {passport_ocr['confidence']}%, справка — {cert_ocr['notes']}")
+
+    api.call("POST", f"/api/v1/applications/{app_id}/transitions", token=operator, json_body={"to": "in_review"}, expect=200)
+    status, body409, _ = api.call("POST", f"/api/v1/applications/{app_id}/transitions", token=operator,
+                                  json_body={"to": "approved"})
     if status != 409:
         fail(f"одобрение с нерешёнными проверками: ожидали 409, получили {status}")
-    ok(f"одобрить нельзя, пока есть нерешённые проверки: {body.get('blocking_checks')}")
-    for code in body["blocking_checks"]:
-        api.call("PATCH", f"/api/v1/applications/{app_id}/checks/{code}", token=moderator,
+    ok(f"одобрить нельзя, пока есть нерешённые проверки: {body409['blocking_checks']}")
+    status, _, _ = api.call("POST", f"/api/v1/applications/{app_id}/transitions", token=operator,
+                            json_body={"to": "rejected"})
+    if status != 422:
+        fail(f"отказ без причины: ожидали 422, получили {status}")
+    ok("отказ без rejection_reason: 422")
+    for code in body409["blocking_checks"]:
+        api.call("PATCH", f"/api/v1/applications/{app_id}/checks/{code}", token=operator,
                  json_body={"status": "manual_ok", "comment": "проверено вручную"}, expect=200)
-    _, final, _ = api.call("POST", f"/api/v1/applications/{app_id}/transitions", token=moderator,
-                           json_body={"to": "approved", "comment": "Одобрено"}, expect=200)
-    ok(f"модератор закрыл проверки и одобрил заявку: {final['status']}")
+    _, final, _ = api.call("POST", f"/api/v1/applications/{app_id}/transitions", token=operator,
+                           json_body={"to": "approved", "comment": "внутренняя заметка"}, expect=200)
+    ok(f"оператор закрыл проверки и одобрил заявку: {final['status']}")
 
-    # 9. Студент видит результат, админ — журнал
     _, st, _ = api.call("GET", f"/api/v1/applications/{app_id}/status", token=student, expect=200)
     if st["status"] != "approved":
         fail(f"студент видит статус {st['status']}")
     _, hist, _ = api.call("GET", f"/api/v1/applications/{app_id}/history", token=student, expect=200)
-    ok("история: " + " -> ".join(h["status"] for h in hist))
-    _, events, _ = api.call("GET", f"/api/v1/admin/audit-events?target_id={app_id}", token=admin, expect=200)
-    ok(f"в журнале аудита по заявке событий: {events['total']}")
+    if any("внутренняя заметка" in json.dumps(h, ensure_ascii=False) for h in hist):
+        fail("студент видит внутреннюю заметку оператора")
+    ok("история для студента: " + " -> ".join(h["status"] for h in hist))
+    if mailbox.available:
+        ok(f"письмо «{mailbox.wait_for(email, 'одобрена')['Subject']}» пришло в Mailpit")
+
+    # ======================= Сценарий B =======================
+    print("\n--- Сценарий B: сбой распознавания не мешает оператору, отказ с причиной ---")
+    email_b, student_b = new_student(api, "student-b")
+    _, app_b, _ = api.call("POST", "/api/v1/applications", token=student_b, json_body=application_body("dormitory", email_b),
+                           expect=201)
+    b_id = app_b["id"]
+    broken = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64 + RUN  # сигнатура верная, картинка битая
+    upload(api, student_b, b_id, "passport_registration", broken, "passport.png")
+    upload(api, student_b, b_id, "union_card", fixture("certificate.png", "b-union"), "union.png")
+    upload(api, student_b, b_id, "bank_requisites_screenshot", fixture("bank.png", "b-bank"), "bank.png")
+    api.call("POST", f"/api/v1/applications/{b_id}/submit", token=student_b, expect=202)
+    ok("студент отправил заявку с нечитаемым сканом паспорта: для него это обычная отправка")
+
+    st = wait_ocr(api, operator, b_id, {"ready_for_review", "ocr_failed"})
+    if st["ocr"]["state"] != "ocr_failed":
+        fail(f"ожидали ocr_failed, получили {st['ocr']}")
+    _, op_b, _ = api.call("GET", f"/api/v1/applications/{b_id}", token=operator, expect=200)
+    failed = next(a for a in op_b["attachments"] if a["type"] == "passport_registration")["ocr"]
+    codes = {c["code"]: c["status"] for c in op_b["checks"]}
+    if failed["status"] != "failed" or codes["inn_checksum"] != "auto_ok" or codes["fio_form_vs_passport"] != "needs_review":
+        fail(f"после сбоя: {failed}, {codes}")
+    ok(f"ocr_failed: заявка открывается, проверки без OCR посчитаны, остальные ждут оператора ({failed['error']})")
+    _, s_status, _ = api.call("GET", f"/api/v1/applications/{b_id}/status", token=student_b, expect=200)
+    assert_student_blind(s_status, "статус после сбоя OCR")
+    if s_status["status"] != "pending":
+        fail(f"студент видит {s_status}")
+    ok("студент по-прежнему видит просто «на рассмотрении»")
+
+    _, restart, _ = api.call("POST", f"/api/v1/applications/{b_id}/ocr/restart", token=operator, expect=202)
+    if restart["ocr"]["state"] != "queued":
+        fail(f"перезапуск OCR: {restart}")
+    wait_ocr(api, operator, b_id, {"ocr_failed"})
+    ok("«Перезапустить OCR»: задача поставлена в очередь и отработала (скан по-прежнему битый — снова ocr_failed)")
+
+    api.call("POST", f"/api/v1/applications/{b_id}/transitions", token=operator, json_body={"to": "in_review"}, expect=200)
+    reason = "Скан паспорта не читается, приложите чёткое фото"
+    api.call("POST", f"/api/v1/applications/{b_id}/transitions", token=operator,
+             json_body={"to": "rejected", "rejection_reason": reason}, expect=200)
+    _, st, _ = api.call("GET", f"/api/v1/applications/{b_id}/status", token=student_b, expect=200)
+    if st["status"] != "rejected" or st.get("rejection_reason") != reason:
+        fail(f"студент не видит причину отказа: {st}")
+    ok("оператор отклонил заявку: студент видит статус и причину отказа")
+    if mailbox.available:
+        letter = mailbox.wait_for(email_b, "отклонена")
+        if reason not in letter["Text"]:
+            fail("в письме об отказе нет причины")
+        ok("письмо «отклонена» с причиной пришло в Mailpit")
+    api.call("POST", "/api/v1/applications", token=student_b, json_body=application_body("dormitory", email_b), expect=201)
+    ok("после отказа студент может подать новую заявку по тому же основанию")
+
+    # ---------- Журнал и статистика ----------
+    _, events, _ = api.call("GET", f"/api/v1/admin/audit-events?target_id={b_id}", token=admin, expect=200)
+    actions = {e["action"] for e in events["items"]}
+    if "application.ocr_restart" not in actions:
+        fail(f"в журнале нет перезапуска OCR: {actions}")
+    ok(f"журнал аудита по заявке B: {sorted(actions)}")
     _, stats, _ = api.call("GET", "/api/v1/admin/stats", token=admin, expect=200)
-    ok(f"статистика: {stats['applications_by_status']}, очередь {stats['queue_length']}/{stats['max_queue_length']}")
+    ok(f"статистика: {stats['applications_by_status']}, роли {stats['users_by_role']}, очередь {stats['queue_length']}")
 
     print("\nВсё работает.")
 

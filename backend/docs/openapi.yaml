@@ -14,8 +14,10 @@ info:
     `Authorization: Bearer <token>`.
 
 
-    Роли: `student` — свои заявки; `moderator` — очередь и проверка; `admin` — всё
-    плюс пользователи и справочник.
+    Роли: `student` — свои заявки; `operator` — очередь, проверка и решение; `admin`
+    — всё плюс пользователи и справочник.
+
+    Распознавание сканов (OCR) и проверки видят только оператор и администратор.
 
     Ошибки возвращаются в формате `application/problem+json` (RFC 9457).
 
@@ -50,8 +52,7 @@ paths:
     get:
       tags:
       - tasks
-      summary: Состояние фоновой задачи Celery (PENDING, STARTED, SUCCESS, FAILURE,
-        RETRY)
+      summary: Состояние фоновой задачи Celery (оператор и админ)
       operationId: task_state_api_v1_tasks__task_id__get
       security:
       - OAuth2PasswordBearer: []
@@ -312,7 +313,7 @@ paths:
       tags:
       - applications
       summary: Список заявок
-      description: Студент видит только свои заявки; модератор и админ — все, с фильтрами.
+      description: Студент видит только свои заявки; оператор и админ — все, с фильтрами.
       operationId: list_applications_api_v1_applications_get
       security:
       - OAuth2PasswordBearer: []
@@ -348,9 +349,9 @@ paths:
           anyOf:
           - type: string
           - type: 'null'
-          description: Только для модератора/админа
+          description: Только для оператора и админа
           title: Applicant User Id
-        description: Только для модератора/админа
+        description: Только для оператора и админа
       - name: limit
         in: query
         required: false
@@ -418,7 +419,7 @@ paths:
     patch:
       tags:
       - applications
-      summary: Изменить черновик (или заявку, по которой запросили документы)
+      summary: Изменить черновик
       operationId: update_application_api_v1_applications__app_id__patch
       security:
       - OAuth2PasswordBearer: []
@@ -499,7 +500,11 @@ paths:
     post:
       tags:
       - applications
-      summary: Отправить заявку на проверку (асинхронно, через Celery)
+      summary: Отправить заявку на рассмотрение
+      description: 'Доступно, когда заполнена форма, есть согласие на обработку ПДн
+        и приложены все документы из списка для выбранного основания (в интерфейсе
+        в этот момент разблокируется кнопка). Ответ 202: заявка принята, о результате
+        студент узнает по статусу и из письма.'
       operationId: submit_application_api_v1_applications__app_id__submit_post
       security:
       - OAuth2PasswordBearer: []
@@ -616,7 +621,7 @@ paths:
     get:
       tags:
       - applications
-      summary: Результаты проверок
+      summary: Результаты автоматических и ручных проверок (оператор и админ)
       operationId: get_checks_api_v1_applications__app_id__checks_get
       security:
       - OAuth2PasswordBearer: []
@@ -637,6 +642,12 @@ paths:
                 items:
                   $ref: '#/components/schemas/CheckOut'
                 title: Response Get Checks Api V1 Applications  App Id  Checks Get
+        '403':
+          description: Forbidden
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
         '404':
           description: Not Found
           content:
@@ -710,7 +721,7 @@ paths:
     get:
       tags:
       - attachments
-      summary: Список вложений
+      summary: Список вложений (оператору — вместе с результатом распознавания)
       operationId: list_attachments_api_v1_applications__app_id__attachments_get
       security:
       - OAuth2PasswordBearer: []
@@ -826,12 +837,15 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
-  /api/v1/moderation/queue:
+  /api/v1/operator/queue:
     get:
       tags:
-      - moderation
-      summary: 'Очередь модератора (FIFO: сначала старые заявки)'
-      operationId: moderation_queue_api_v1_moderation_queue_get
+      - operator
+      summary: 'Очередь оператора (FIFO: сначала старые заявки)'
+      description: 'В каждой заявке — ocr_state (ready_for_review, ocr_failed, ...)
+        и ocr_accuracy, %. Заявки с ocr_failed тоже открываются: распознавание можно
+        перезапустить.'
+      operationId: operator_queue_api_v1_operator_queue_get
       security:
       - OAuth2PasswordBearer: []
       parameters:
@@ -845,6 +859,14 @@ paths:
           type: string
           default: pending
           title: Status
+      - name: ocr_state
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - $ref: '#/components/schemas/OcrState'
+          - type: 'null'
+          title: Ocr State
       - name: basis
         in: query
         required: false
@@ -894,8 +916,11 @@ paths:
   /api/v1/applications/{app_id}/transitions:
     post:
       tags:
-      - moderation
-      summary: Сменить статус заявки (модератор/админ)
+      - operator
+      summary: Сменить статус заявки (оператор / админ)
+      description: 'pending -> in_review (взять в работу), in_review -> approved |
+        rejected | pending. При to=rejected обязательно rejection_reason: его увидит
+        студент. О переходе в approved и rejected студенту уходит письмо.'
       operationId: transition_api_v1_applications__app_id__transitions_post
       security:
       - OAuth2PasswordBearer: []
@@ -940,7 +965,7 @@ paths:
   /api/v1/applications/{app_id}/checks/{code}:
     patch:
       tags:
-      - moderation
+      - operator
       summary: Ручное решение по проверке (manual_ok / manual_rejected)
       operationId: decide_check_api_v1_applications__app_id__checks__code__patch
       security:
@@ -979,6 +1004,55 @@ paths:
                 $ref: '#/components/schemas/Problem'
         '409':
           description: Conflict
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/applications/{app_id}/ocr/restart:
+    post:
+      tags:
+      - operator
+      summary: Перезапустить распознавание (оператор / админ)
+      description: Заново распознаёт все вложения заявки и пересчитывает автоматические
+        проверки; решения оператора по проверкам сохраняются. Доступно для заявок
+        на рассмотрении, пока распознавание не идёт (или завис дольше OCR_STALE_MINUTES).
+      operationId: restart_ocr_api_v1_applications__app_id__ocr_restart_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: app_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: App Id
+      responses:
+        '202':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OcrRestartOut'
+        '404':
+          description: Not Found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: Conflict
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '503':
+          description: Service Unavailable
           content:
             application/problem+json:
               schema:
@@ -1377,7 +1451,6 @@ components:
       - draft
       - pending
       - in_review
-      - need_more_docs
       - approved
       - rejected
       title: AppStatus
@@ -1441,15 +1514,14 @@ components:
             $ref: '#/components/schemas/AttachmentOut'
           type: array
           title: Attachments
-        checks:
-          items:
-            $ref: '#/components/schemas/CheckOut'
-          type: array
-          title: Checks
         status:
           $ref: '#/components/schemas/AppStatus'
-        processing:
-          $ref: '#/components/schemas/ProcessingOut'
+        rejection_reason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Rejection Reason
+          description: Причина отказа (при статусе rejected)
         created_at:
           type: string
           format: date-time
@@ -1458,6 +1530,17 @@ components:
           type: string
           format: date-time
           title: Updated At
+        checks:
+          anyOf:
+          - items:
+              $ref: '#/components/schemas/CheckOut'
+            type: array
+          - type: 'null'
+          title: Checks
+        ocr:
+          anyOf:
+          - $ref: '#/components/schemas/OcrOut'
+          - type: 'null'
       type: object
       required:
       - id
@@ -1469,9 +1552,7 @@ components:
       - payout
       - form
       - attachments
-      - checks
       - status
-      - processing
       - created_at
       - updated_at
       title: ApplicationOut
@@ -1488,6 +1569,11 @@ components:
           title: Period
         status:
           $ref: '#/components/schemas/AppStatus'
+        rejection_reason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Rejection Reason
         student_full_name:
           type: string
           title: Student Full Name
@@ -1497,8 +1583,6 @@ components:
         group:
           type: string
           title: Group
-        processing_state:
-          $ref: '#/components/schemas/ProcessingState'
         created_at:
           type: string
           format: date-time
@@ -1507,6 +1591,15 @@ components:
           type: string
           format: date-time
           title: Updated At
+        ocr_state:
+          anyOf:
+          - $ref: '#/components/schemas/OcrState'
+          - type: 'null'
+        ocr_accuracy:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Ocr Accuracy
       type: object
       required:
       - id
@@ -1516,7 +1609,6 @@ components:
       - student_full_name
       - institute
       - group
-      - processing_state
       - created_at
       - updated_at
       title: ApplicationSummary
@@ -1537,6 +1629,77 @@ components:
       additionalProperties: false
       type: object
       title: ApplicationUpdate
+    AttachmentOcrOut:
+      properties:
+        status:
+          type: string
+          title: Status
+        engine:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Engine
+        confidence:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Confidence
+          description: Средняя уверенность Tesseract по словам, %
+        pages:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Pages
+        words:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Words
+        extracted:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Extracted
+        text_preview:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Text Preview
+        seal:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Seal
+          description: Найдена печать
+        signature:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Signature
+          description: Найдена подпись
+        notes:
+          items:
+            type: string
+          type: array
+          title: Notes
+          default: []
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error
+        finished_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Finished At
+      type: object
+      required:
+      - status
+      title: AttachmentOcrOut
+      description: Результат распознавания вложения. Только для оператора и администратора.
     AttachmentOut:
       properties:
         attachment_id:
@@ -1566,9 +1729,11 @@ components:
           type: string
           format: date-time
           title: Uploaded At
-        ocr_status:
-          type: string
-          title: Ocr Status
+        ocr:
+          anyOf:
+          - $ref: '#/components/schemas/AttachmentOcrOut'
+          - type: 'null'
+          description: Только для оператора и администратора
       type: object
       required:
       - attachment_id
@@ -1578,7 +1743,6 @@ components:
       - size_bytes
       - sha256
       - uploaded_at
-      - ocr_status
       title: AttachmentOut
     AuditEventOut:
       properties:
@@ -1932,8 +2096,11 @@ components:
           format: date-time
           title: At
         by:
-          type: string
+          anyOf:
+          - type: string
+          - type: 'null'
           title: By
+          description: Только для оператора и администратора
         by_role:
           anyOf:
           - type: string
@@ -1944,12 +2111,72 @@ components:
           - type: string
           - type: 'null'
           title: Comment
+          description: Студент видит только причину отказа; оператор — все заметки
       type: object
       required:
       - status
       - at
-      - by
       title: HistoryItem
+    OcrOut:
+      properties:
+        state:
+          $ref: '#/components/schemas/OcrState'
+        accuracy:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Accuracy
+          description: Точность распознавания, %
+        engine:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Engine
+        task_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Task Id
+        updated_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Updated At
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Error
+      type: object
+      required:
+      - state
+      title: OcrOut
+      description: Состояние распознавания заявки. Студенту не показывается.
+    OcrRestartOut:
+      properties:
+        id:
+          type: string
+          title: Id
+        ocr:
+          $ref: '#/components/schemas/OcrOut'
+      type: object
+      required:
+      - id
+      - ocr
+      title: OcrRestartOut
+    OcrState:
+      type: string
+      enum:
+      - not_started
+      - queued
+      - running
+      - ready_for_review
+      - ocr_failed
+      title: OcrState
+      description: 'Состояние распознавания заявки. Видно только оператору и администратору:
+
+        студент о распознавании ничего не знает.'
     Page_ApplicationSummary_:
       properties:
         items:
@@ -2073,39 +2300,6 @@ components:
       - bik
       - account_number
       title: PayoutIn
-    ProcessingOut:
-      properties:
-        state:
-          $ref: '#/components/schemas/ProcessingState'
-        task_id:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Task Id
-        updated_at:
-          anyOf:
-          - type: string
-            format: date-time
-          - type: 'null'
-          title: Updated At
-        error:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Error
-      type: object
-      required:
-      - state
-      title: ProcessingOut
-    ProcessingState:
-      type: string
-      enum:
-      - idle
-      - queued
-      - running
-      - done
-      - failed
-      title: ProcessingState
     RefreshIn:
       properties:
         refresh_token:
@@ -2187,7 +2381,7 @@ components:
       type: string
       enum:
       - student
-      - moderator
+      - operator
       - admin
       title: Role
     StatsOut:
@@ -2232,17 +2426,24 @@ components:
           title: Id
         status:
           $ref: '#/components/schemas/AppStatus'
-        processing:
-          $ref: '#/components/schemas/ProcessingOut'
+        rejection_reason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Rejection Reason
         updated_at:
           type: string
           format: date-time
           title: Updated At
+        ocr:
+          anyOf:
+          - $ref: '#/components/schemas/OcrOut'
+          - type: 'null'
+          description: Только для оператора и администратора
       type: object
       required:
       - id
       - status
-      - processing
       - updated_at
       title: StatusOut
     StudentIn:
@@ -2258,17 +2459,17 @@ components:
           maxLength: 200
           minLength: 5
           title: Full Name
-          description: ФИО в именительном падеже
+          description: ФИО в именительном падеже, как в паспорте
           examples:
           - Иванов Иван Иванович
         full_name_as_written:
-          type: string
-          maxLength: 200
-          minLength: 5
+          anyOf:
+          - type: string
+            maxLength: 200
+          - type: 'null'
           title: Full Name As Written
-          description: ФИО как в заявлении (родительный падеж)
-          examples:
-          - Иванова Ивана Ивановича
+          description: 'Устарело: родительный падеж больше не нужен, поле игнорируется
+            и оставлено для совместимости'
         birth_date:
           type: string
           format: date
@@ -2299,11 +2500,11 @@ components:
           - type: 'null'
           title: Phone
         email:
-          anyOf:
-          - type: string
-            format: email
-          - type: 'null'
+          type: string
+          format: email
           title: Email
+          description: Адрес для уведомлений о статусе заявки (принята, одобрена,
+            отклонена)
         inn:
           anyOf:
           - type: string
@@ -2324,11 +2525,11 @@ components:
       type: object
       required:
       - full_name
-      - full_name_as_written
       - birth_date
       - institute
       - group
       - course
+      - email
       title: StudentIn
     SubmitOut:
       properties:
@@ -2337,18 +2538,10 @@ components:
           title: Id
         status:
           $ref: '#/components/schemas/AppStatus'
-        task_id:
-          type: string
-          title: Task Id
-        status_url:
-          type: string
-          title: Status Url
       type: object
       required:
       - id
       - status
-      - task_id
-      - status_url
       title: SubmitOut
     TaskOut:
       properties:
@@ -2388,12 +2581,22 @@ components:
       properties:
         to:
           $ref: '#/components/schemas/AppStatus'
+        rejection_reason:
+          anyOf:
+          - type: string
+            maxLength: 2000
+            minLength: 3
+          - type: 'null'
+          title: Rejection Reason
+          description: 'Причина отказа: обязательна при to=rejected, студент увидит
+            её в кабинете и в письме'
         comment:
           anyOf:
           - type: string
             maxLength: 2000
           - type: 'null'
           title: Comment
+          description: Внутренняя заметка оператора
       additionalProperties: false
       type: object
       required:
@@ -2533,5 +2736,5 @@ components:
           scopes: {}
           tokenUrl: /api/v1/auth/login
 servers:
-- url: http://localhost:8080
+- url: http://localhost:8000
   description: docker compose (nginx)

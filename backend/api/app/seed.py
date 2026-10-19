@@ -1,60 +1,77 @@
-"""Справочник оснований (коллекция application_types) — 13 бланков СППО.
+"""Начальные данные: справочник оснований и демо-учётки.
 
-Таблица из schema_zayavok_sppo.md, раздел 2. Слот с несколькими any_of
-выражает формулировку «ИЛИ» из бланка.
+Ручной запуск (создаёт демо-учётки независимо от SEED_DEMO_USERS):
+    docker compose exec api python -m app.seed
+
+При старте стека вызывается из bootstrap: справочник — всегда, демо-учётки — если SEED_DEMO_USERS=true.
+Всё идемпотентно: существующие записи не перезаписываются, пароли существующих учёток не меняются.
 """
 
-COMMON_SLOTS = [
-    {"slot": "passport", "any_of": ["passport_registration"]},
-    {"slot": "union_card", "any_of": ["union_card"]},
-    {"slot": "bank", "any_of": ["bank_requisites_screenshot"]},
+import asyncio
+import logging
+
+from app import cache, db
+from app.benefit_data import BENEFIT_TYPES  # noqa: F401  (реэкспорт для тестов и обратной совместимости)
+from app.domain import Role
+from app.services.users import create_user
+
+log = logging.getLogger("seed")
+
+# Известные пароли: только для разработки и демонстрации.
+DEMO_USERS = [
+    {"email": "student@rut.ru", "password": "student123", "full_name": "Иванов Иван Иванович",
+     "role": Role.student},
+    {"email": "operator@rut.ru", "password": "operator123", "full_name": "Петрова Мария Сергеевна",
+     "role": Role.operator},
+    {"email": "admin@rut.ru", "password": "admin123", "full_name": "Администратор системы",
+     "role": Role.admin},
 ]
 
-BIRTH_STUDENT = {"slot": "birth", "any_of": ["birth_certificate_student"]}
+
+async def seed_benefit_types() -> int:
+    """Добавляет недостающие основания; правки администратора не затираются."""
+    coll = db.get_db()[db.APPLICATION_TYPES]
+    created = 0
+    for item in BENEFIT_TYPES:
+        data = {k: v for k, v in item.items() if k != "_id"}
+        result = await coll.update_one(
+            {"_id": item["_id"]}, {"$setOnInsert": {**data, "updated_at": db.utcnow()}}, upsert=True
+        )
+        created += result.upserted_id is not None
+    await cache.delete(cache.BENEFIT_TYPES_KEY)
+    log.info("Benefit types: %d created, %d already present", created, len(BENEFIT_TYPES) - created)
+    return created
 
 
-def _basis(slot_types: list[str]) -> dict:
-    return {"slot": "basis_doc", "any_of": slot_types}
+async def seed_demo_users() -> int:
+    """Создаёт демо-учётки student@rut.ru, operator@rut.ru, admin@rut.ru. Возвращает число созданных."""
+    users = db.get_db()[db.USERS]
+    created = 0
+    for spec in DEMO_USERS:
+        if await users.find_one({"email": spec["email"]}, {"_id": 1}):
+            continue
+        await create_user(spec["email"], spec["password"], spec["full_name"], spec["role"])
+        created += 1
+        log.info("Created demo user %s (%s)", spec["email"], spec["role"])
+    if created:
+        log.warning("Demo accounts with well-known passwords exist: do not use with real data")
+    return created
 
 
-_TYPES = [
-    ("orphan", 1, "Студент-сирота",
-     [BIRTH_STUDENT, _basis(["death_certificate", "parental_rights_deprivation"])], []),
-    ("disabled", 2, "Студент-инвалид",
-     [_basis(["disability_certificate"])], []),
-    ("has_child", 3, "Студент, воспитывающий ребёнка",
-     [{"slot": "child_birth", "any_of": ["birth_certificate_child"]}], []),
-    ("single_parent", 4, "Студент из семьи родителя-одиночки",
-     [BIRTH_STUDENT, _basis(["paternity_basis_certificate"])], []),
-    ("breadwinner_loss", 5, "Студент, потерявший кормильца",
-     [BIRTH_STUDENT, _basis(["death_certificate", "missing_person_court_decision"])], []),
-    ("parents_disabled_or_pensioners", 6, "Родители — инвалиды или пенсионеры",
-     [BIRTH_STUDENT, _basis(["pension_certificate_parents"])], []),
-    ("large_family", 7, "Студент из многодетной семьи",
-     [BIRTH_STUDENT, _basis(["large_family_certificate", "family_composition_certificate"])], []),
-    ("combat_veteran", 8, "Участник военных действий",
-     [{"slot": "service", "any_of": ["military_service_certificate"]},
-      {"slot": "military_id", "any_of": ["military_id"]}], []),
-    ("dispensary", 9, "Студент на диспансерном учёте",
-     [{"slot": "medical", "any_of": ["medical_certificate"]}], ["doctor_certified"]),
-    ("chernobyl", 10, "Студент-чернобылец",
-     [_basis(["chernobyl_certificate"])], []),
-    ("parents_divorced", 11, "Студент из семьи разведённых родителей",
-     [BIRTH_STUDENT, _basis(["divorce_certificate"])], []),
-    ("dormitory", 12, "Студент, проживающий в общежитии",
-     [], ["dorm_head_signed"]),
-    ("no_stipend", 13, "Студент, не получающий стипендию",
-     [{"slot": "grades", "any_of": ["grades_extract"], "note": "для студентов-бюджетников"}], []),
-]
+async def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    await db.connect()
+    await cache.connect()
+    try:
+        await seed_benefit_types()
+        created = await seed_demo_users()
+        print(f"Готово: создано демо-учёток — {created}")
+        for spec in DEMO_USERS:
+            print(f"  {spec['role']:<9} {spec['email']:<18} пароль: {spec['password']}")
+    finally:
+        await cache.close()
+        await db.close()
 
-BENEFIT_TYPES: list[dict] = [
-    {
-        "_id": code,
-        "form_no": form_no,
-        "title": title,
-        "requires": COMMON_SLOTS + extra,
-        "manual_flags": manual_flags,
-        "is_active": True,
-    }
-    for code, form_no, title, extra, manual_flags in _TYPES
-]
+
+if __name__ == "__main__":
+    asyncio.run(main())

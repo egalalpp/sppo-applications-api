@@ -10,7 +10,7 @@ from fastapi.openapi.utils import get_openapi
 
 from app import cache, db, errors
 from app.config import get_settings
-from app.routers import admin, applications, attachments, auth, benefit_types, moderation, system
+from app.routers import admin, applications, attachments, auth, benefit_types, operator, system
 from app.schemas import Problem
 
 API_PREFIX = "/api/v1"
@@ -24,7 +24,8 @@ DESCRIPTION = """
 `POST /api/v1/auth/register`, администратор — из `.env`) и передавайте его в заголовке
 `Authorization: Bearer <token>`.
 
-Роли: `student` — свои заявки; `moderator` — очередь и проверка; `admin` — всё плюс пользователи и справочник.
+Роли: `student` — свои заявки; `operator` — очередь, проверка и решение; `admin` — всё плюс пользователи и справочник.
+Распознавание сканов (OCR) и проверки видят только оператор и администратор.
 Ошибки возвращаются в формате `application/problem+json` (RFC 9457).
 """
 
@@ -69,7 +70,7 @@ def create_app() -> FastAPI:
     errors.install(app)
 
     app.include_router(system.router)
-    for module in (auth, benefit_types, applications, attachments, moderation, admin):
+    for module in (auth, benefit_types, applications, attachments, operator, admin):
         app.include_router(module.router, prefix=API_PREFIX)
 
     @app.get("/redoc", include_in_schema=False)

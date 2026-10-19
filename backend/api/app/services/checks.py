@@ -1,14 +1,18 @@
 """Формирование списка проверок заявки (checks[]).
 
-Чистые функции без обращений к БД: на вход документ заявки, справочник основания
-и найденные дубли, на выходе список проверок. Их вызывает Celery-воркер,
+Чистые функции без обращений к БД и Tesseract: на вход документ заявки, справочник основания,
+найденные дубли и распознанные тексты, на выходе список проверок. Их вызывает Celery-воркер,
 и их же покрывают юнит-тесты.
+
+Проверки, не зависящие от OCR (комплект, ИНН, счёт, паспорт, дубли), считаются всегда.
+Проверки по распознанным сканам при сбое распознавания получают статус needs_review:
+сбой OCR — внутреннее дело оператора, он проверяет такие пункты глазами.
 """
 
 from datetime import datetime
 
 from app.domain import CheckStatus
-from app.services import fio, validators
+from app.services import fio, ocr_fields, validators
 
 # Проверки, которые делает только человек (раздел 6.5 схемы).
 BASE_MANUAL_CHECKS = {
@@ -20,6 +24,8 @@ MANUAL_FLAG_TITLES = {
     "dorm_head_signed": "Подпись заведующего общежитием",
     "doctor_certified": "Справка заверена врачом (подпись и печать)",
 }
+
+OCR_UNAVAILABLE = "Распознавание не выполнено: проверьте вручную по скану"
 
 
 def _check(code: str, kind: str, status: str, now: datetime, details=None, score=None) -> dict:
@@ -44,7 +50,60 @@ def missing_slots(attachments: list[dict], benefit_type: dict) -> list[str]:
     return missing
 
 
-def build_auto_checks(app: dict, benefit_type: dict, duplicates: dict, now: datetime) -> list[dict]:
+def _ocr_checks(student: dict, payout: dict, ocr_texts: dict[str, str], now: datetime) -> list[dict]:
+    """Сверка формы со сканами. ocr_texts: тип документа -> распознанный текст;
+    типа нет в словаре, если распознать его не удалось."""
+    checks = []
+    passport_text = ocr_texts.get("passport_registration")
+    bank_text = ocr_texts.get("bank_requisites_screenshot")
+
+    # ФИО из формы и в паспорте
+    if passport_text is None:
+        checks.append(_check("fio_form_vs_passport", "auto", CheckStatus.needs_review, now,
+                             details=OCR_UNAVAILABLE))
+    else:
+        score = fio.name_in_text(passport_text, student.get("full_name", ""))
+        checks.append(_check("fio_form_vs_passport", "auto", fio.classify(score), now, score=score))
+
+    # Серия и номер паспорта: точное совпадение цифр
+    passport = student.get("passport")
+    if not passport:
+        checks.append(_check("passport_number_vs_scan", "auto", CheckStatus.needs_review, now,
+                             details="Паспортные данные не указаны"))
+    elif passport_text is None:
+        checks.append(_check("passport_number_vs_scan", "auto", CheckStatus.needs_review, now,
+                             details=OCR_UNAVAILABLE))
+    else:
+        outcome, found = ocr_fields.compare_passport(passport_text, passport["series"], passport["number"])
+        status = {"ok": CheckStatus.auto_ok, "mismatch": CheckStatus.mismatch}.get(outcome, CheckStatus.needs_review)
+        details = None if outcome == "ok" else (
+            {"found_in_scan": found} if found else "Серия и номер на скане не распознаны")
+        checks.append(_check("passport_number_vs_scan", "auto", status, now, details=details))
+
+    # Реквизиты: БИК и счёт из формы на скриншоте банка
+    if bank_text is None:
+        checks.append(_check("bank_requisites_vs_scan", "auto", CheckStatus.needs_review, now,
+                             details=OCR_UNAVAILABLE))
+        checks.append(_check("bank_owner_confirmed", "auto", CheckStatus.needs_review, now,
+                             details=OCR_UNAVAILABLE))
+    else:
+        outcome, info = ocr_fields.compare_bank(bank_text, payout.get("bik", ""), payout.get("account_number", ""))
+        status = {"ok": CheckStatus.auto_ok, "mismatch": CheckStatus.mismatch}.get(outcome, CheckStatus.needs_review)
+        checks.append(_check("bank_requisites_vs_scan", "auto", status, now,
+                             details=None if outcome == "ok" else info))
+        # На скриншоте должно быть хоть какое-то подтверждение, что счёт принадлежит заявителю
+        # (ответ оператора профкома на интервью). Без совпадения — только на ручную проверку.
+        score = fio.given_names_in_text(bank_text, student.get("full_name", ""))
+        confirmed = score >= fio.AUTO_OK_THRESHOLD
+        checks.append(_check(
+            "bank_owner_confirmed", "auto",
+            CheckStatus.auto_ok if confirmed else CheckStatus.needs_review, now, score=score,
+            details=None if confirmed else "На скриншоте не найдены имя и отчество владельца счёта"))
+    return checks
+
+
+def build_auto_checks(app: dict, benefit_type: dict, duplicates: dict, now: datetime,
+                      ocr_texts: dict[str, str] | None = None) -> list[dict]:
     student = app.get("student", {})
     payout = app.get("payout", {})
     checks = []
@@ -80,12 +139,7 @@ def build_auto_checks(app: dict, benefit_type: dict, duplicates: dict, now: date
                          CheckStatus.auto_ok if ok else CheckStatus.mismatch, now,
                          details=None if ok else "Контрольный ключ счёта по БИК не сходится"))
 
-    score = fio.fio_similarity(student.get("full_name", ""), student.get("full_name_as_written", ""))
-    checks.append(_check("fio_nominative_vs_written", "auto", fio.classify(score), now, score=score))
-
-    # OCR в прототипе — заглушка, поэтому сверка со сканом паспорта уходит человеку.
-    checks.append(_check("fio_form_vs_passport", "auto", CheckStatus.needs_review, now,
-                         details="OCR-заглушка: сверьте ФИО со сканом паспорта вручную"))
+    checks += _ocr_checks(student, payout, ocr_texts or {}, now)
 
     dup_files = duplicates.get("files", [])
     checks.append(_check(
@@ -114,12 +168,11 @@ def build_manual_checks(benefit_type: dict, now: datetime) -> list[dict]:
 
 
 def merge_checks(existing: list[dict], auto: list[dict], manual: list[dict]) -> list[dict]:
-    """Автопроверки пересчитываются заново (после досылки документов прежние решения
-    по ним устарели); решения модератора по ручным проверкам сохраняются."""
+    """При повторном распознавании пересчитываются все проверки, кроме тех, по которым
+    оператор уже принял решение: ручное решение (manual_ok / manual_rejected) сохраняется."""
     decided = {
         c["code"]: c
         for c in existing
-        if c.get("kind") == "manual"
-        and c.get("status") in (CheckStatus.manual_ok, CheckStatus.manual_rejected)
+        if c.get("status") in (CheckStatus.manual_ok, CheckStatus.manual_rejected)
     }
-    return auto + [decided.get(c["code"], c) for c in manual]
+    return [decided.get(c["code"], c) for c in auto + manual]

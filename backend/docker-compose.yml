@@ -13,16 +13,35 @@ x-app-env: &app-env
   REDIS_HOST: redis
   REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is not set}
   JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is not set}
-  S3_ENDPOINT: http://s3:8333
-  S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-http://localhost:8333}
+  # Хранилище: по умолчанию локальный SeaweedFS из этого compose. Чтобы использовать облако
+  # (Cloudflare R2 и др.), задайте S3_ENDPOINT_URL, ключи, S3_REGION и S3_PUBLIC_ENDPOINT_URL в .env.
+  S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://s3:8333}
+  S3_PUBLIC_ENDPOINT_URL: ${S3_PUBLIC_ENDPOINT_URL:-http://localhost:8333}
+  S3_REGION: ${S3_REGION:-us-east-1}
   S3_ACCESS_KEY: ${S3_ACCESS_KEY:?S3_ACCESS_KEY is not set}
   S3_SECRET_KEY: ${S3_SECRET_KEY:?S3_SECRET_KEY is not set}
   S3_BUCKET: ${S3_BUCKET:-sppo-docs}
   CURRENT_PERIOD: ${CURRENT_PERIOD:-2026-autumn}
   MAX_QUEUE_LENGTH: ${MAX_QUEUE_LENGTH:-50000}
-  OCR_STUB_DELAY_SEC: ${OCR_STUB_DELAY_SEC:-2}
   CORS_ORIGINS: ${CORS_ORIGINS:-[]}
   CELERY_BROKER: ${CELERY_BROKER:-}
+  FRONTEND_URL: ${FRONTEND_URL:-}
+  SEED_DEMO_USERS: ${SEED_DEMO_USERS:-false}
+  # Распознавание (Tesseract)
+  OCR_ENABLED: ${OCR_ENABLED:-true}
+  OCR_LANG: ${OCR_LANG:-rus+eng}
+  OCR_MAX_SIDE_PX: ${OCR_MAX_SIDE_PX:-2000}
+  OCR_TIMEOUT_SEC: ${OCR_TIMEOUT_SEC:-180}
+  OCR_STALE_MINUTES: ${OCR_STALE_MINUTES:-15}
+  # Почта: по умолчанию письма уходят в Mailpit из этого compose (http://localhost:8025)
+  EMAIL_BACKEND: ${EMAIL_BACKEND:-}
+  SMTP_HOST: ${SMTP_HOST:-mailpit}
+  SMTP_PORT: ${SMTP_PORT:-1025}
+  SMTP_USER: ${SMTP_USER:-}
+  SMTP_PASS: ${SMTP_PASS:-}
+  SMTP_STARTTLS: ${SMTP_STARTTLS:-}
+  BREVO_API_KEY: ${BREVO_API_KEY:-}
+  MAIL_FROM: ${MAIL_FROM:-СППО РУТ (МИИТ) <noreply@sppo.local>}
 
 # Один образ на четыре сервиса: отличаются только командой.
 x-app: &app
@@ -99,6 +118,21 @@ services:
       retries: 12
       start_period: 15s
 
+  # Почтовая «песочница» для разработки: принимает все письма и показывает их в веб-интерфейсе,
+  # наружу ничего не отправляет. Для настоящей рассылки задайте SMTP_* или BREVO_API_KEY в .env.
+  mailpit:
+    image: axllent/mailpit:v1.31
+    restart: unless-stopped
+    environment:
+      MP_MAX_MESSAGES: 500
+    ports:
+      - "127.0.0.1:8025:8025"  # веб-интерфейс; SMTP (1025) доступен только внутри сети compose
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
   # ---------- Приложение ----------
   init:
     <<: *app
@@ -132,10 +166,11 @@ services:
 
   worker:
     <<: *app
+    # Распознавание заявок (очередь applications) и отправка писем (очередь mail).
     # CELERY_CONCURRENCY — число параллельных обработчиков (c в модели M/M/c/K).
-    command: ["sh", "-c", "exec celery -A app.worker.celery_app:celery_app worker -Q applications --loglevel=INFO --concurrency=$${CELERY_CONCURRENCY}"]
     environment:
       <<: *app-env
+      RUN_MODE: worker
       CELERY_CONCURRENCY: ${CELERY_CONCURRENCY:-4}
     depends_on:
       init:
@@ -164,7 +199,7 @@ services:
     image: nginx:1.28.0-alpine
     restart: unless-stopped
     ports:
-      - "${HTTP_PORT:-8080}:80"
+      - "${HTTP_PORT:-8000}:80"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./nginx/proxy_params.conf:/etc/nginx/proxy_params.conf:ro

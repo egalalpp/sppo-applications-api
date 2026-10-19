@@ -1,17 +1,32 @@
 import pytest
 
-from app.domain import can_transition, detect_file_type
+from app.domain import AppStatus, OcrState, Role, can_transition, detect_file_type
+
+
+def test_final_status_list():
+    assert [s.value for s in AppStatus] == ["draft", "pending", "in_review", "approved", "rejected"]
+
+
+def test_roles_have_operator_instead_of_moderator():
+    assert [r.value for r in Role] == ["student", "operator", "admin"]
+
+
+def test_ocr_states_for_operator():
+    assert {s.value for s in OcrState} >= {"queued", "running", "ready_for_review", "ocr_failed"}
 
 
 @pytest.mark.parametrize("current,target,role,allowed", [
     ("draft", "pending", "student", True),
-    ("need_more_docs", "pending", "student", True),
     ("pending", "approved", "student", False),
-    ("draft", "pending", "moderator", False),
-    ("pending", "in_review", "moderator", True),
-    ("in_review", "approved", "moderator", True),
+    ("rejected", "pending", "student", False),  # после отказа заявка не переоткрывается
+    ("draft", "pending", "operator", False),
+    ("pending", "in_review", "operator", True),
+    ("in_review", "approved", "operator", True),
+    ("in_review", "rejected", "operator", True),
     ("in_review", "approved", "admin", True),
-    ("pending", "approved", "moderator", False),  # без взятия в работу
+    ("in_review", "pending", "operator", True),  # вернуть в общую очередь
+    ("pending", "approved", "operator", False),  # без взятия в работу
+    ("pending", "rejected", "operator", False),
     ("approved", "rejected", "admin", False),  # финальный статус
 ])
 def test_transitions(current, target, role, allowed):

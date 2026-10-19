@@ -1,7 +1,7 @@
 """Выгружает OpenAPI-схему приложения в docs/openapi.yaml.
 
 Запуск (нужны зависимости из api/requirements-dev.txt):  python scripts/export_openapi.py
-Альтернатива — скачать http://localhost:8080/openapi.json из запущенного стека.
+Альтернатива — скачать http://localhost:8000/openapi.json из запущенного стека.
 """
 
 import os
@@ -23,7 +23,7 @@ for name, value in {
 from app.main import app  # noqa: E402
 
 schema = app.openapi()
-schema["servers"] = [{"url": "http://localhost:8080", "description": "docker compose (nginx)"}]
+schema["servers"] = [{"url": "http://localhost:8000", "description": "docker compose (nginx)"}]
 
 out = ROOT / "docs" / "openapi.yaml"
 out.write_text(yaml.safe_dump(schema, allow_unicode=True, sort_keys=False), encoding="utf-8")

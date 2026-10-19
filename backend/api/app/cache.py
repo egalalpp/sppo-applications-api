@@ -14,8 +14,14 @@ from app.config import get_settings
 BENEFIT_TYPES_KEY = "cache:benefit_types:v1"
 
 
-def app_status_key(app_id: str) -> str:
-    return f"cache:app_status:{app_id}"
+def app_status_key(app_id: str, staff: bool = False) -> str:
+    # Студент и оператор видят разные поля статуса (оператор — ещё и состояние OCR),
+    # поэтому кэшируются отдельно.
+    return f"cache:app_status:{app_id}:{'staff' if staff else 'student'}"
+
+
+def app_status_keys(app_id: str) -> list[str]:
+    return [app_status_key(app_id, False), app_status_key(app_id, True)]
 
 
 def idempotency_key(user_id: str, key: str) -> str:

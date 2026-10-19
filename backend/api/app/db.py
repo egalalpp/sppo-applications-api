@@ -20,7 +20,7 @@ _client: AsyncMongoClient | None = None
 async def connect() -> None:
     global _client
     settings = get_settings()
-    _client = AsyncMongoClient(settings.mongo_uri, tz_aware=True, serverSelectionTimeoutMS=5000)
+    _client = AsyncMongoClient(settings.mongo_dsn, tz_aware=True, serverSelectionTimeoutMS=10000)
 
 
 async def close() -> None:

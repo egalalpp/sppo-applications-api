@@ -1,10 +1,14 @@
 """Общая логика работы с заявками для роутеров."""
 
+from datetime import timedelta
+
 from bson import ObjectId
 from starlette.concurrency import run_in_threadpool
 
 from app import cache, db
+from app.config import get_settings
 from app.deps import is_staff
+from app.domain import OCR_IN_FLIGHT
 from app.errors import ApiError
 from app.worker.celery_app import PROCESS_APPLICATION, producer_app
 
@@ -36,7 +40,7 @@ def history_entry(status: str, user: dict, comment: str | None = None) -> dict:
 
 
 async def invalidate_status(app_id: ObjectId | str) -> None:
-    await cache.delete(cache.app_status_key(str(app_id)))
+    await cache.delete(*cache.app_status_keys(str(app_id)))
 
 
 async def enqueue_processing(app_id: ObjectId) -> str:
@@ -45,3 +49,15 @@ async def enqueue_processing(app_id: ObjectId) -> str:
         producer_app.send_task, PROCESS_APPLICATION, args=[str(app_id)]
     )
     return result.id
+
+
+def ocr_busy(doc: dict) -> bool:
+    """Идёт ли сейчас распознавание заявки. Состояние старше ocr_stale_minutes считается
+    зависшим (воркер упал, очередь потеряна) и не блокирует действия оператора."""
+    ocr = doc.get("ocr") or {}
+    if ocr.get("state") not in OCR_IN_FLIGHT:
+        return False
+    updated_at = ocr.get("updated_at")
+    if updated_at is None:
+        return True
+    return db.utcnow() - updated_at < timedelta(minutes=get_settings().ocr_stale_minutes)

@@ -1,0 +1,88 @@
+# Render Blueprint: бесплатный тариф, весь бэкенд в одном контейнере.
+# Подробная инструкция: backend/docs/DEPLOY.md
+#
+# Почему так устроено:
+#  - runtime: docker — в образ нужно поставить Tesseract (apt), нативное окружение Python это не умеет;
+#  - RUN_MODE=all — на бесплатном тарифе нет фоновых воркеров, поэтому Celery работает
+#    рядом с веб-сервером в том же контейнере (backend/api/entrypoint.sh);
+#  - письма уходят по HTTPS через Brevo API: бесплатные веб-сервисы Render закрывают
+#    исходящий SMTP (порты 25, 465, 587);
+#  - MongoDB Atlas и Cloudflare R2 — внешние сервисы, их параметры задаются при создании Blueprint.
+
+services:
+  - type: web
+    name: sppo-api
+    runtime: docker
+    plan: free
+    region: frankfurt  # ближайший к России регион Render
+    dockerfilePath: ./backend/api/Dockerfile
+    dockerContext: ./backend/api
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      # --- режим «всё в одном контейнере» ---
+      - key: RUN_MODE
+        value: all
+      - key: CELERY_POOL
+        value: threads
+      - key: CELERY_CONCURRENCY
+        value: "2"
+      - key: ENVIRONMENT
+        value: prod
+
+      # --- секреты и подключения: Render спросит значения при создании Blueprint ---
+      - key: JWT_SECRET
+        generateValue: true
+      - key: MONGO_URI
+        sync: false
+      - key: MONGO_DB
+        value: sppo
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: sppo-redis
+          property: connectionString
+
+      # --- хранилище сканов: Cloudflare R2 ---
+      - key: S3_ENDPOINT_URL
+        sync: false
+      - key: S3_PUBLIC_ENDPOINT_URL
+        sync: false
+      - key: S3_ACCESS_KEY
+        sync: false
+      - key: S3_SECRET_KEY
+        sync: false
+      - key: S3_BUCKET
+        value: sppo-documents
+      - key: S3_REGION
+        value: auto
+
+      # --- почта: Brevo по HTTPS ---
+      - key: EMAIL_BACKEND
+        value: brevo
+      - key: BREVO_API_KEY
+        sync: false
+      - key: MAIL_FROM
+        sync: false  # например: СППО РУТ (МИИТ) <адрес, подтверждённый в Brevo>
+
+      # --- фронтенд (GitHub Pages) ---
+      - key: CORS_ORIGINS
+        sync: false  # JSON-список, например: ["https://username.github.io"]
+      - key: FRONTEND_URL
+        sync: false  # например: https://username.github.io/sppo
+
+      # --- учётные записи ---
+      - key: SEED_DEMO_USERS
+        value: "true"  # student@rut.ru / operator@rut.ru / admin@rut.ru с паролями из ТЗ; на реальных данных — false
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+
+  # Очередь Celery и кэш. Бесплатный Key Value хранит данные только в памяти (25 МБ):
+  # при перезапуске очередь теряется, зависшие заявки оператор перезапускает кнопкой «Перезапустить OCR».
+  - type: keyvalue
+    name: sppo-redis
+    plan: free
+    maxmemoryPolicy: noeviction  # в Redis лежит очередь задач: вытеснять ключи нельзя
+    ipAllowList: []  # только внутренняя сеть Render

@@ -1,5 +1,8 @@
 """Celery: брокер и бэкенд результатов — Redis (db 1 и db 2).
 
+Две очереди: applications (распознавание и проверки заявок, долгие задачи) и mail (письма),
+чтобы уведомление не ждало за долгим OCR. Воркер слушает обе: -Q applications,mail.
+
 Число параллельных обработчиков (c из модели M/M/c/K в PD.ipynb) задаётся
 переменной CELERY_CONCURRENCY и/или числом реплик сервиса worker.
 """
@@ -10,6 +13,14 @@ from app.config import get_settings
 
 settings = get_settings()
 
+PROCESS_APPLICATION = "applications.process"
+SEND_EMAIL = "notifications.send_email"
+
+TASK_ROUTES = {
+    PROCESS_APPLICATION: {"queue": settings.celery_queue},
+    SEND_EMAIL: {"queue": settings.celery_mail_queue},
+}
+
 celery_app = Celery(
     "sppo",
     broker=settings.celery_broker_url,
@@ -19,6 +30,7 @@ celery_app = Celery(
 
 celery_app.conf.update(
     task_default_queue=settings.celery_queue,
+    task_routes=TASK_ROUTES,
     task_serializer="json",
     result_serializer="json",
     accept_content=["json"],
@@ -31,14 +43,13 @@ celery_app.conf.update(
     timezone="Europe/Moscow",
 )
 
-PROCESS_APPLICATION = "applications.process"
-
 # API только ставит задачи. У этого экземпляра нет бэкенда результатов: иначе Redis-бэкенд
 # подписывался бы на канал результата каждой отправленной задачи. Состояние задачи
-# API читает через celery_app (GET /tasks/{id}) или из поля processing в MongoDB.
+# API читает через celery_app (GET /tasks/{id}) или из поля ocr в MongoDB.
 producer_app = Celery("sppo-producer", broker=settings.celery_broker_url, set_as_current=False)
 producer_app.conf.update(
     task_default_queue=settings.celery_queue,
+    task_routes=TASK_ROUTES,
     task_serializer="json",
     accept_content=["json"],
     broker_connection_retry_on_startup=True,

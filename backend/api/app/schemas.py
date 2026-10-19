@@ -3,9 +3,9 @@
 from datetime import date, datetime
 from typing import Any, Generic, Literal, TypeVar
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
-from app.domain import ATTACHMENT_TYPES, AppStatus, CheckStatus, ProcessingState, Role
+from app.domain import ATTACHMENT_TYPES, AppStatus, CheckStatus, OcrState, Role
 
 T = TypeVar("T")
 
@@ -105,15 +105,16 @@ class PassportIn(Strict):
 class StudentIn(Strict):
     student_id: str | None = Field(default=None, max_length=50)
     full_name: str = Field(min_length=5, max_length=200, examples=["Иванов Иван Иванович"],
-                           description="ФИО в именительном падеже")
-    full_name_as_written: str = Field(min_length=5, max_length=200, examples=["Иванова Ивана Ивановича"],
-                                      description="ФИО как в заявлении (родительный падеж)")
+                           description="ФИО в именительном падеже, как в паспорте")
+    full_name_as_written: str | None = Field(
+        default=None, max_length=200,
+        description="Устарело: родительный падеж больше не нужен, поле игнорируется и оставлено для совместимости")
     birth_date: date
     institute: str = Field(min_length=2, max_length=100, examples=["ИУЦТ"])
     group: str = Field(min_length=2, max_length=50, examples=["ТКИ-211"])
     course: int = Field(ge=1, le=6)
     phone: str | None = Field(default=None, pattern=r"^\+?[\d\s\-()]{7,20}$")
-    email: EmailStr | None = None
+    email: EmailStr = Field(description="Адрес для уведомлений о статусе заявки (принята, одобрена, отклонена)")
     inn: str | None = Field(default=None, pattern=r"^\d{12}$")
     registration_address: str | None = Field(default=None, max_length=500)
     passport: PassportIn | None = None
@@ -147,6 +148,22 @@ class ApplicationUpdate(Strict):
     form: FormIn | None = None
 
 
+class AttachmentOcrOut(BaseModel):
+    """Результат распознавания вложения. Только для оператора и администратора."""
+    status: str
+    engine: str | None = None
+    confidence: int | None = Field(default=None, description="Средняя уверенность Tesseract по словам, %")
+    pages: int | None = None
+    words: int | None = None
+    extracted: dict | None = None
+    text_preview: str | None = None
+    seal: bool | None = Field(default=None, description="Найдена печать")
+    signature: bool | None = Field(default=None, description="Найдена подпись")
+    notes: list[str] = []
+    error: str | None = None
+    finished_at: datetime | None = None
+
+
 class AttachmentOut(BaseModel):
     attachment_id: str
     type: str
@@ -156,7 +173,7 @@ class AttachmentOut(BaseModel):
     sha256: str
     original_filename: str | None = None
     uploaded_at: datetime
-    ocr_status: str
+    ocr: AttachmentOcrOut | None = Field(default=None, description="Только для оператора и администратора")
 
 
 class CheckOut(BaseModel):
@@ -173,13 +190,17 @@ class CheckOut(BaseModel):
 class HistoryItem(BaseModel):
     status: AppStatus
     at: datetime
-    by: str
+    by: str | None = Field(default=None, description="Только для оператора и администратора")
     by_role: str | None = None
-    comment: str | None = None
+    comment: str | None = Field(
+        default=None, description="Студент видит только причину отказа; оператор — все заметки")
 
 
-class ProcessingOut(BaseModel):
-    state: ProcessingState
+class OcrOut(BaseModel):
+    """Состояние распознавания заявки. Студенту не показывается."""
+    state: OcrState
+    accuracy: int | None = Field(default=None, description="Точность распознавания, %")
+    engine: str | None = None
     task_id: str | None = None
     updated_at: datetime | None = None
     error: str | None = None
@@ -195,11 +216,13 @@ class ApplicationOut(BaseModel):
     payout: PayoutIn
     form: FormIn
     attachments: list[AttachmentOut]
-    checks: list[CheckOut]
     status: AppStatus
-    processing: ProcessingOut
+    rejection_reason: str | None = Field(default=None, description="Причина отказа (при статусе rejected)")
     created_at: datetime
     updated_at: datetime
+    # Только для оператора и администратора; студент этих полей не получает
+    checks: list[CheckOut] | None = None
+    ocr: OcrOut | None = None
 
 
 class ApplicationSummary(BaseModel):
@@ -207,31 +230,49 @@ class ApplicationSummary(BaseModel):
     basis: str
     period: str
     status: AppStatus
+    rejection_reason: str | None = None
     student_full_name: str
     institute: str
     group: str
-    processing_state: ProcessingState
     created_at: datetime
     updated_at: datetime
+    # Только для оператора и администратора
+    ocr_state: OcrState | None = None
+    ocr_accuracy: int | None = None
 
 
 class StatusOut(BaseModel):
     id: str
     status: AppStatus
-    processing: ProcessingOut
+    rejection_reason: str | None = None
     updated_at: datetime
+    ocr: OcrOut | None = Field(default=None, description="Только для оператора и администратора")
 
 
 class SubmitOut(BaseModel):
     id: str
     status: AppStatus
-    task_id: str
-    status_url: str
+
+
+class OcrRestartOut(BaseModel):
+    id: str
+    ocr: OcrOut
 
 
 class TransitionIn(Strict):
     to: AppStatus
-    comment: str | None = Field(default=None, max_length=2000)
+    rejection_reason: str | None = Field(
+        default=None, min_length=3, max_length=2000,
+        description="Причина отказа: обязательна при to=rejected, студент увидит её в кабинете и в письме")
+    comment: str | None = Field(default=None, max_length=2000, description="Внутренняя заметка оператора")
+
+    @model_validator(mode="after")
+    def _reason_only_for_rejection(self) -> "TransitionIn":
+        if self.to == AppStatus.rejected and not self.rejection_reason:
+            raise ValueError("rejection_reason обязателен при отклонении заявки")
+        if self.to != AppStatus.rejected and self.rejection_reason:
+            raise ValueError("rejection_reason допустим только при to=rejected")
+        return self
 
 
 class CheckDecisionIn(Strict):

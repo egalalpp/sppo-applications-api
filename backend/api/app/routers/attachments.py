@@ -23,7 +23,7 @@ def _coll():
     return db.get_db()[db.APPLICATIONS]
 
 
-@router.post("", response_model=AttachmentOut, status_code=201,
+@router.post("", response_model=AttachmentOut, status_code=201, response_model_exclude_unset=True,
              responses=responses(404, 409, 413, 415, 422),
              summary="Загрузить скан документа (PDF, JPEG или PNG)")
 async def upload_attachment(
@@ -95,10 +95,12 @@ async def upload_attachment(
     return attachment_out(attachment)
 
 
-@router.get("", response_model=list[AttachmentOut], responses=responses(404), summary="Список вложений")
+@router.get("", response_model=list[AttachmentOut], response_model_exclude_unset=True,
+            responses=responses(404),
+            summary="Список вложений (оператору — вместе с результатом распознавания)")
 async def list_attachments(app_id: str, user: dict = Depends(get_current_user)):
     doc = await svc.load(app_id, user, {"attachments": 1})
-    return [attachment_out(a) for a in doc.get("attachments", [])]
+    return [attachment_out(a, is_staff(user)) for a in doc.get("attachments", [])]
 
 
 @router.get("/{attachment_id}/download-url", response_model=DownloadUrlOut, responses=responses(404),
