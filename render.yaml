@@ -33,6 +33,8 @@ services:
       # --- секреты и подключения: Render спросит значения при создании Blueprint ---
       - key: JWT_SECRET
         generateValue: true
+      - key: HASH_PEPPER
+        generateValue: true  # секрет HMAC-хэшей паспорта и счёта; не менять без `python -m app.bootstrap --rehash`
       - key: MONGO_URI
         sync: false
       - key: MONGO_DB

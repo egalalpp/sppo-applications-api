@@ -94,3 +94,23 @@ def test_student_email_is_required_for_notifications():
 def test_genitive_form_of_name_is_optional():
     assert StudentIn(**student()).full_name_as_written is None
     assert StudentIn(**student(full_name_as_written="Иванова Ивана Ивановича")).full_name_as_written
+
+
+def test_audit_logs_endpoint_replaces_audit_events():
+    paths = client.get("/openapi.json").json()["paths"]
+    assert "/api/v1/admin/audit-logs" in paths and "/api/v1/admin/audit-events" not in paths
+
+
+def test_form_has_no_signature_fields_and_ignores_legacy_ones():
+    from app.schemas import FormIn
+
+    form = FormIn.model_validate({"consent_pd_signed": True, "applicant_signed": True, "signed_date": "2026-10-20",
+                                  "dorm_head_signed": True})
+    assert form.model_dump(exclude_unset=True) == {"consent_pd_signed": True}  # старые поля молча игнорируются
+
+
+def test_benefit_types_have_priority_equal_to_form_number():
+    from app.seed import BENEFIT_TYPES
+
+    assert all(t["priority"] == t["form_no"] for t in BENEFIT_TYPES)
+    assert min(t["priority"] for t in BENEFIT_TYPES) == 1

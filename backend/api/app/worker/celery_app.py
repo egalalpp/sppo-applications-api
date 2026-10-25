@@ -53,4 +53,10 @@ producer_app.conf.update(
     task_serializer="json",
     accept_content=["json"],
     broker_connection_retry_on_startup=True,
+    # Если брокер недоступен, отправка задачи должна провалиться за секунды, а не подвесить запрос студента:
+    # заявку всё равно подхватит подметальщик (services/ocr_queue.py).
+    broker_connection_timeout=2,
+    task_publish_retry=True,
+    task_publish_retry_policy={"max_retries": 1, "interval_start": 0, "interval_step": 0.2, "interval_max": 0.5},
+    broker_transport_options={"socket_connect_timeout": 2, "socket_timeout": 3},
 )

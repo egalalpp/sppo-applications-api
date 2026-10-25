@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT / "api"))
 # Для генерации схемы подключения к БД не нужны — подставляем заглушки.
 for name, value in {
     "MONGO_APP_USER": "x", "MONGO_APP_PASSWORD": "x", "REDIS_PASSWORD": "x",
-    "JWT_SECRET": "x" * 32, "S3_ACCESS_KEY": "x", "S3_SECRET_KEY": "x",
+    "JWT_SECRET": "x" * 32, "HASH_PEPPER": "x" * 16, "S3_ACCESS_KEY": "x", "S3_SECRET_KEY": "x",
 }.items():
     os.environ.setdefault(name, value)
 

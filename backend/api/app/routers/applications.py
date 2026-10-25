@@ -2,16 +2,18 @@
 
 Студент видит только данные заявки и её статус (с причиной отказа). Распознавание (OCR),
 проверки и их результаты — внутренняя кухня оператора: в ответах студенту этих полей нет.
+Отправка заявки не зависит от очереди и брокера: если задачу распознавания поставить не удалось,
+заявку подхватит подметальщик (services/ocr_queue.py), а студент об этом не узнает.
 """
 
 from fastapi import APIRouter, Depends, Header, Query, Response
 from pymongo import ReturnDocument
 from starlette.concurrency import run_in_threadpool
 
-from app import cache, db, storage
+from app import audit, cache, db, storage
 from app.config import get_settings
 from app.deps import get_current_user, is_staff, require_staff, require_student
-from app.domain import EDITABLE_STATUSES, OCR_IN_FLIGHT, AppStatus, OcrState, can_transition
+from app.domain import EDITABLE_STATUSES, OCR_IN_FLIGHT, AppStatus, can_transition
 from app.errors import ApiError, responses
 from app.schemas import (
     ApplicationCreate,
@@ -32,12 +34,13 @@ from app.serializers import (
     status_out,
 )
 from app.services import applications as svc
-from app.services import benefit_types, notifications
+from app.services import benefit_types, hashing, notifications, transitions
 from app.services.checks import missing_slots
+from app.services.ocr_queue import initial_ocr, try_enqueue_ocr
 
 router = APIRouter(prefix="/applications", tags=["applications"])
 
-SCHEMA_VERSION = 4  # v4: роль operator, статусы без need_more_docs, rejection_reason, ocr вместо processing
+SCHEMA_VERSION = 5  # v5: priority, submitted_at, хэши паспорта и счёта, form без подписи, audit_logs
 IDEMPOTENCY_TTL_SEC = 24 * 3600
 # Маркер «запрос в работе» живёт недолго: если реплика упадёт посреди запроса,
 # ключ не заблокируется на сутки.
@@ -52,11 +55,6 @@ def _coll():
     return db.get_db()[db.APPLICATIONS]
 
 
-def initial_ocr() -> dict:
-    return {"state": OcrState.not_started, "accuracy": None, "engine": None, "task_id": None,
-            "updated_at": None, "error": None}
-
-
 @router.post("", response_model=ApplicationOut, status_code=201, responses=responses(409, 422),
              summary="Создать заявку (черновик)", **VIEW)
 async def create_application(
@@ -68,14 +66,19 @@ async def create_application(
 ):
     redis_key = cache.idempotency_key(str(user["_id"]), idempotency_key) if idempotency_key else None
     if redis_key:
-        existing = await cache.cache().get(redis_key)
-        if existing == _IN_PROGRESS:
-            raise ApiError(409, "Запрос с этим Idempotency-Key ещё обрабатывается")
-        if existing:
-            response.status_code = 200
-            return application_out(await svc.load(existing, user))
-        if not await cache.cache().set(redis_key, _IN_PROGRESS, nx=True, ex=IDEMPOTENCY_LOCK_SEC):
-            raise ApiError(409, "Запрос с этим Idempotency-Key ещё обрабатывается")
+        try:
+            existing = await cache.cache().get(redis_key)
+            if existing == _IN_PROGRESS:
+                raise ApiError(409, "Запрос с этим Idempotency-Key ещё обрабатывается")
+            if existing:
+                response.status_code = 200
+                return application_out(await svc.load(existing, user))
+            if not await cache.cache().set(redis_key, _IN_PROGRESS, nx=True, ex=IDEMPOTENCY_LOCK_SEC):
+                raise ApiError(409, "Запрос с этим Idempotency-Key ещё обрабатывается")
+        except ApiError:
+            raise
+        except Exception:  # noqa: BLE001 — Redis недоступен: создаём заявку без защиты от повтора
+            redis_key = None
 
     try:
         doc = await _insert_application(body, user)
@@ -84,7 +87,10 @@ async def create_application(
             await cache.delete(redis_key)
         raise
     if redis_key:
-        await cache.cache().set(redis_key, str(doc["_id"]), ex=IDEMPOTENCY_TTL_SEC)
+        try:
+            await cache.cache().set(redis_key, str(doc["_id"]), ex=IDEMPOTENCY_TTL_SEC)
+        except Exception:  # noqa: BLE001 — заявка уже создана, защита от повтора необязательна
+            pass
     return application_out(doc)
 
 
@@ -105,25 +111,33 @@ async def _insert_application(body: ApplicationCreate, user: dict) -> dict:
 
     now = db.utcnow()
     student = body.student.model_dump(mode="json", exclude={"full_name_as_written"})
+    payout = body.payout.model_dump(mode="json")
+    hashing.apply_hashes(student, payout)
+    form = body.form.model_dump(mode="json")
+    form["consent_pd_at"] = now if form["consent_pd_signed"] else None
     doc = {
         "schema_version": SCHEMA_VERSION,
         "applicant_user_id": user["_id"],
         "period": period,
         "basis": body.basis,
+        # снимок: смена приоритета основания старые заявки не двигает
+        "priority": benefit_type.get("priority") or benefit_type.get("form_no") or 100,
         "student": student,
-        "payout": body.payout.model_dump(mode="json"),
-        "form": body.form.model_dump(mode="json"),
+        "payout": payout,
+        "form": form,
         "attachments": [],
         "checks": [],
         "status": AppStatus.draft,
         "rejection_reason": None,
         "status_history": [svc.history_entry(AppStatus.draft, user)],
         "ocr": initial_ocr(),
+        "submitted_at": None,
         "created_at": now,
         "updated_at": now,
     }
     result = await _coll().insert_one(doc)
     doc["_id"] = result.inserted_id
+    await audit.log(user, audit.CLAIM_CREATED, "application", doc["_id"], {"basis": body.basis, "period": period})
     return doc
 
 
@@ -165,18 +179,28 @@ async def get_application(app_id: str, user: dict = Depends(get_current_user)):
 @router.patch("/{app_id}", response_model=ApplicationOut, responses=responses(404, 409, 422),
               summary="Изменить черновик", **VIEW)
 async def update_application(app_id: str, body: ApplicationUpdate, user: dict = Depends(require_student)):
-    changes = {}
-    for field in ("student", "payout", "form"):
-        part = getattr(body, field)
-        if part is not None:
-            changes[field] = part.model_dump(mode="json", exclude={"full_name_as_written"} if field == "student" else None)
+    doc = await svc.load(app_id, user, {"status": 1, "form": 1})
+    now = db.utcnow()
+    changes: dict = {}
+    if body.student is not None:
+        changes["student"] = body.student.model_dump(mode="json", exclude={"full_name_as_written"})
+    if body.payout is not None:
+        changes["payout"] = body.payout.model_dump(mode="json")
+    hashing.apply_hashes(changes.get("student"), changes.get("payout"))  # паспорт или счёт изменились: хэши заново
+    if body.form is not None:
+        # Поля формы обновляются по одному: consent_pd_at и подпись заведующего общежитием не затираются
+        given = body.form.model_dump(mode="json", exclude_unset=True)
+        changes.update({f"form.{key}": value for key, value in given.items()})
+        if given.get("consent_pd_signed") and not (doc.get("form") or {}).get("consent_pd_signed"):
+            changes["form.consent_pd_at"] = now
+        elif given.get("consent_pd_signed") is False:
+            changes["form.consent_pd_at"] = None
     if not changes:
         raise ApiError(422, "Нет полей для изменения")
 
-    doc = await svc.load(app_id, user, {"status": 1})
     updated = await _coll().find_one_and_update(
         {"_id": doc["_id"], "applicant_user_id": user["_id"], "status": {"$in": list(EDITABLE_STATUSES)}},
-        {"$set": {**changes, "updated_at": db.utcnow()}},
+        {"$set": {**changes, "updated_at": now}},
         return_document=ReturnDocument.AFTER,
     )
     if updated is None:
@@ -199,11 +223,12 @@ async def delete_application(app_id: str, user: dict = Depends(require_student))
 
 
 @router.post("/{app_id}/submit", response_model=SubmitOut, status_code=202,
-             responses=responses(404, 409, 422, 503),
+             responses=responses(404, 409, 422),
              summary="Отправить заявку на рассмотрение",
              description="Доступно, когда заполнена форма, есть согласие на обработку ПДн и приложены все документы "
                          "из списка для выбранного основания (в интерфейсе в этот момент разблокируется кнопка). "
-                         "Ответ 202: заявка принята, о результате студент узнает по статусу и из письма.")
+                         "Ответ 202: заявка принята и ждёт оператора, о результате студент узнает по статусу и из "
+                         "письма. Отправка не зависит от состояния очереди и воркеров.")
 async def submit_application(app_id: str, user: dict = Depends(require_student)):
     doc = await svc.load(app_id, user)
     current = doc["status"]
@@ -219,47 +244,19 @@ async def submit_application(app_id: str, user: dict = Depends(require_student))
     if missing:
         raise ApiError(422, "Приложены не все обязательные документы", extra={"missing_slots": missing})
 
-    # Ограниченная ёмкость K из модели M/M/c/K: при переполнении — отказ с 503.
-    settings = get_settings()
-    if await cache.queue_length() >= settings.max_queue_length:
-        raise ApiError(503, "Сервис перегружен, повторите позже", headers={"Retry-After": "60"})
-
+    # Статус, история и событие аудита — одна транзакция. Очередь тут не участвует: даже если брокер недоступен
+    # или переполнен, заявка уже на рассмотрении, а в очередь её поставит подметальщик.
     now = db.utcnow()
-    result = await _coll().update_one(
-        {"_id": doc["_id"], "status": current},
-        {
-            "$set": {
-                "status": AppStatus.pending,
-                "ocr": {**initial_ocr(), "state": OcrState.queued, "updated_at": now},
-                "attachments.$[].ocr.status": "queued",
-                "updated_at": now,
-            },
-            "$push": {"status_history": svc.history_entry(AppStatus.pending, user)},
-        },
+    updated = await transitions.apply_transition(
+        doc, to=AppStatus.pending, actor=user, event_type=audit.CLAIM_SUBMITTED, expected_from=current,
+        set_fields={"submitted_at": now, "rejection_reason": None, "ocr": initial_ocr()},
     )
-    if result.modified_count == 0:
+    if updated is None:
         raise ApiError(409, "Статус заявки изменился, обновите данные")
 
-    try:
-        task_id = await svc.enqueue_processing(doc["_id"])
-    except Exception:
-        # Брокер недоступен: откатываем заявку в прежний статус.
-        await _coll().update_one(
-            {"_id": doc["_id"], "status": AppStatus.pending},
-            {
-                "$set": {"status": current, "ocr": doc.get("ocr") or initial_ocr(),
-                         "attachments.$[a].ocr.status": "not_started"},
-                "$pop": {"status_history": 1},
-            },
-            array_filters=[{"a.ocr.status": "queued"}],
-        )
-        await svc.invalidate_status(doc["_id"])
-        raise ApiError(503, "Сервис временно недоступен, повторите позже", headers={"Retry-After": "30"}) from None
-
-    await _coll().update_one({"_id": doc["_id"], "ocr.task_id": None}, {"$set": {"ocr.task_id": task_id}})
     await svc.invalidate_status(doc["_id"])
-    await notifications.notify_status({**doc, "status": AppStatus.pending}, AppStatus.pending,
-                                      benefit_type.get("title", doc["basis"]))
+    await try_enqueue_ocr(updated)
+    await notifications.notify_status(updated, AppStatus.pending, benefit_type.get("title", doc["basis"]))
     return {"id": app_id, "status": AppStatus.pending}
 
 

@@ -5,18 +5,15 @@
 можно открыть, фото и форма на месте, а распознавание можно перезапустить кнопкой.
 """
 
-from datetime import timedelta
 from typing import Literal
 
 from fastapi import APIRouter, Depends, Query
 from pymongo import ReturnDocument
 
 from app import audit, db
-from app.config import get_settings
 from app.deps import require_staff
 from app.domain import (
     BLOCKING_CHECK_STATUSES,
-    OCR_IN_FLIGHT,
     STAFF_TRANSITIONS,
     AppStatus,
     OcrState,
@@ -34,7 +31,8 @@ from app.schemas import (
 )
 from app.serializers import SUMMARY_PROJECTION, application_out, application_summary, ocr_out
 from app.services import applications as svc
-from app.services import benefit_types, notifications
+from app.services import benefit_types, notifications, transitions
+from app.services.ocr_queue import BrokerUnavailable, enqueue_ocr
 
 router = APIRouter(tags=["operator"])
 
@@ -46,8 +44,9 @@ def _coll():
 
 
 @router.get("/operator/queue", response_model=Page[ApplicationSummary],
-            summary="Очередь оператора (FIFO: сначала старые заявки)",
-            description="В каждой заявке — ocr_state (ready_for_review, ocr_failed, ...) и ocr_accuracy, %. "
+            summary="Очередь оператора: по приоритету основания, затем по времени подачи",
+            description="Сначала заявки с меньшим `priority` (выше приоритет), внутри одного приоритета — те, что поданы "
+                        "раньше. В каждой заявке — ocr_state (ready_for_review, ocr_failed...) и ocr_accuracy, %. "
                         "Заявки с ocr_failed тоже открываются: распознавание можно перезапустить.", **VIEW)
 async def operator_queue(
     user: dict = Depends(require_staff),
@@ -65,8 +64,8 @@ async def operator_queue(
         query["basis"] = basis
     if period:
         query["period"] = period
-    # Индекс {status: 1, created_at: 1} из схемы покрывает и фильтр, и сортировку.
-    cursor = _coll().find(query, SUMMARY_PROJECTION).sort("created_at", 1).skip(offset).limit(limit)
+    # Индекс {status, priority, submitted_at} покрывает и фильтр по статусу, и сортировку.
+    cursor = _coll().find(query, SUMMARY_PROJECTION).sort([("priority", 1), ("submitted_at", 1)]).skip(offset).limit(limit)
     items = [application_summary(d, staff=True) async for d in cursor]
     total = await _coll().count_documents(query)
     return {"items": items, "total": total, "limit": limit, "offset": offset}
@@ -93,23 +92,17 @@ async def transition(app_id: str, body: TransitionIn, user: dict = Depends(requi
             raise ApiError(409, "Есть нерешённые проверки", extra={"blocking_checks": blocking})
 
     rejected = target == AppStatus.rejected
-    updated = await _coll().find_one_and_update(
-        {"_id": doc["_id"], "status": current},
-        {
-            "$set": {"status": target, "rejection_reason": body.rejection_reason if rejected else None,
-                     "updated_at": db.utcnow()},
-            # В историю, которую видит студент, попадает только причина отказа.
-            "$push": {"status_history": svc.history_entry(
-                target, user, body.rejection_reason if rejected else body.comment)},
-        },
-        return_document=ReturnDocument.AFTER,
+    updated = await transitions.apply_transition(
+        doc, to=target, actor=user, expected_from=current,
+        event_type=audit.TRANSITION_EVENTS[(current, target)],
+        set_fields={"rejection_reason": body.rejection_reason if rejected else None},
+        # В историю, которую видит студент, попадает только причина отказа
+        comment=body.rejection_reason if rejected else body.comment,
+        details={"rejection_reason": body.rejection_reason, "comment": body.comment},
     )
     if updated is None:
         raise ApiError(409, "Статус заявки изменился, обновите данные")
 
-    await audit.log(user, "application.transition", "application", app_id,
-                    {"from": current, "to": target, "rejection_reason": body.rejection_reason,
-                     "comment": body.comment})
     await svc.invalidate_status(doc["_id"])
     benefit = await benefit_types.get(doc["basis"])
     await notifications.notify_status(updated, target, (benefit or {}).get("title", doc["basis"]))
@@ -141,7 +134,7 @@ async def decide_check(app_id: str, code: str, body: CheckDecisionIn, user: dict
     if updated is None:
         raise ApiError(409, "Заявка изменилась, обновите данные")
 
-    await audit.log(user, "application.check_decision", "application", app_id,
+    await audit.log(user, audit.CHECK_SET, "application", app_id,
                     {"code": code, "status": body.status, "comment": body.comment})
     return next(c for c in updated["checks"] if c["code"] == code)
 
@@ -158,35 +151,13 @@ async def restart_ocr(app_id: str, user: dict = Depends(require_staff)):
     if svc.ocr_busy(doc):
         raise ApiError(409, "Распознавание уже идёт")
 
-    now = db.utcnow()
-    stale_before = now - timedelta(minutes=get_settings().ocr_stale_minutes)
-    previous = doc.get("ocr") or {}
-    updated = await _coll().find_one_and_update(
-        {
-            "_id": doc["_id"],
-            "status": {"$in": [AppStatus.pending, AppStatus.in_review]},
-            # условие в фильтре — защита от двойного нажатия кнопки
-            "$or": [{"ocr.state": {"$nin": list(OCR_IN_FLIGHT)}}, {"ocr.updated_at": {"$lt": stale_before}}],
-        },
-        {"$set": {
-            "ocr.state": OcrState.queued, "ocr.error": None, "ocr.task_id": None, "ocr.updated_at": now,
-            "attachments.$[].ocr.status": "queued", "updated_at": now,
-        }},
-        projection={"ocr": 1},
-        return_document=ReturnDocument.AFTER,
-    )
-    if updated is None:
+    try:
+        # Состояние занимается атомарно (условие на прежнее состояние): двойное нажатие кнопки не создаст две задачи
+        task_id = await enqueue_ocr(doc, actor=user, event_type=audit.OCR_RESTARTED)
+    except BrokerUnavailable:
+        raise ApiError(503, "Очередь недоступна, повторите позже", headers={"Retry-After": "30"}) from None
+    if task_id is None:
         raise ApiError(409, "Распознавание уже идёт")
 
-    try:
-        task_id = await svc.enqueue_processing(doc["_id"])
-    except Exception:
-        await _coll().update_one({"_id": doc["_id"]}, {"$set": {"ocr": previous or {"state": OcrState.ocr_failed}}})
-        await svc.invalidate_status(doc["_id"])
-        raise ApiError(503, "Очередь недоступна, повторите позже", headers={"Retry-After": "30"}) from None
-
-    await _coll().update_one({"_id": doc["_id"], "ocr.state": OcrState.queued}, {"$set": {"ocr.task_id": task_id}})
-    await svc.invalidate_status(doc["_id"])
-    await audit.log(user, "application.ocr_restart", "application", app_id, {"previous_state": previous.get("state")})
-    updated["ocr"]["task_id"] = task_id
-    return {"id": app_id, "ocr": ocr_out(updated)}
+    fresh = await _coll().find_one({"_id": doc["_id"]}, {"ocr": 1})
+    return {"id": app_id, "ocr": ocr_out(fresh)}

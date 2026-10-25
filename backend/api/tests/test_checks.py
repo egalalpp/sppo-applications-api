@@ -123,3 +123,12 @@ def test_merge_keeps_operator_decisions_on_any_check():
     # решение оператора по автоматической проверке не затирается повторным распознаванием
     assert merged["fio_form_vs_passport"]["status"] == "manual_ok"
     assert merged["inn_checksum"]["by"] == "system"
+
+
+def test_duplicate_passport_check():
+    clean = by_code(build_auto_checks(make_app(FULL_ORPHAN_SET), ORPHAN, {}, NOW, ocr_texts=GOOD_OCR))
+    assert clean["duplicate_passport"]["status"] == "auto_ok"
+    dup = by_code(build_auto_checks(make_app(FULL_ORPHAN_SET), ORPHAN, {"passport": ["6acd52dda70b810daca703cf"]},
+                                    NOW, ocr_texts=GOOD_OCR))
+    assert dup["duplicate_passport"]["status"] == "needs_review"
+    assert dup["duplicate_passport"]["details"] == {"application_ids": ["6acd52dda70b810daca703cf"]}

@@ -10,7 +10,7 @@ import logging
 
 from starlette.concurrency import run_in_threadpool
 
-from app import db
+from app import cache, db
 from app.config import get_settings
 from app.domain import NOTIFY_STATUSES, AppStatus
 from app.worker.celery_app import SEND_EMAIL, producer_app
@@ -78,6 +78,9 @@ async def notify_status(application: dict, status: str, basis_title: str) -> boo
     не должна ломать смену статуса, поэтому исключения только пишутся в лог."""
     try:
         if AppStatus(status) not in NOTIFY_STATUSES:
+            return False
+        if not cache.queue_available():
+            log.warning("Queue is unavailable: the %s notification for %s is skipped", status, application.get("_id"))
             return False
         to = await recipient_for(application)
         if not to:

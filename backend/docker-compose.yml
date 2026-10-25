@@ -8,11 +8,13 @@ x-app-env: &app-env
   ENVIRONMENT: ${ENVIRONMENT:-dev}
   MONGO_HOST: mongo
   MONGO_DB: ${MONGO_DB:-sppo}
+  MONGO_REPLICA_SET: rs0  # replica set из одного узла (сервис mongo ниже): нужен для транзакций
   MONGO_APP_USER: ${MONGO_APP_USER:?MONGO_APP_USER is not set, copy .env.example to .env}
   MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD:?MONGO_APP_PASSWORD is not set}
   REDIS_HOST: redis
   REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is not set}
   JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is not set}
+  HASH_PEPPER: ${HASH_PEPPER:?HASH_PEPPER is not set, copy .env.example to .env}
   # Хранилище: по умолчанию локальный SeaweedFS из этого compose. Чтобы использовать облако
   # (Cloudflare R2 и др.), задайте S3_ENDPOINT_URL, ключи, S3_REGION и S3_PUBLIC_ENDPOINT_URL в .env.
   S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://s3:8333}
@@ -33,6 +35,9 @@ x-app-env: &app-env
   OCR_MAX_SIDE_PX: ${OCR_MAX_SIDE_PX:-2000}
   OCR_TIMEOUT_SEC: ${OCR_TIMEOUT_SEC:-180}
   OCR_STALE_MINUTES: ${OCR_STALE_MINUTES:-15}
+  # Подметальщик: ставит в очередь заявки, которые не попали туда при отправке
+  SWEEPER_ENABLED: ${SWEEPER_ENABLED:-true}
+  SWEEP_INTERVAL_SEC: ${SWEEP_INTERVAL_SEC:-30}
   # Почта: по умолчанию письма уходят в Mailpit из этого compose (http://localhost:8025)
   EMAIL_BACKEND: ${EMAIL_BACKEND:-}
   SMTP_HOST: ${SMTP_HOST:-mailpit}
@@ -57,6 +62,11 @@ services:
   mongo:
     image: mongo:8.0
     restart: unless-stopped
+    # Replica set из одного узла нужен для транзакций: статус заявки и запись в журнал аудита меняются
+    # атомарно. entrypoint.sh создаёт keyFile (его требует авторизация вместе с replica set) и запускает
+    # штатную точку входа; healthcheck.sh один раз выполняет rs.initiate, вручную ничего делать не нужно.
+    entrypoint: ["/bin/sh", "/mongo-entrypoint.sh"]
+    command: ["mongod", "--replSet", "rs0", "--keyFile", "/tmp/mongo-keyfile", "--bind_ip_all"]
     environment:
       MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:?MONGO_ROOT_USER is not set}
       MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?MONGO_ROOT_PASSWORD is not set}
@@ -67,12 +77,14 @@ services:
     volumes:
       - mongo-data:/data/db
       - ./mongo/init:/docker-entrypoint-initdb.d:ro
+      - ./mongo/entrypoint.sh:/mongo-entrypoint.sh:ro
+      - ./mongo/healthcheck.sh:/mongo-healthcheck.sh:ro
     healthcheck:
-      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 20s
+      test: ["CMD", "sh", "/mongo-healthcheck.sh"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 15s
     # Порт наружу не публикуется: к базе ходят только сервисы внутри сети compose.
 
   redis:

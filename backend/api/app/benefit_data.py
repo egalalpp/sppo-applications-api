@@ -51,6 +51,7 @@ BENEFIT_TYPES: list[dict] = [
     {
         "_id": code,
         "form_no": form_no,
+        "priority": form_no,  # меньше число — выше приоритет; по умолчанию как номер бланка, админ может изменить
         "title": title,
         "requires": COMMON_SLOTS + extra,
         "manual_flags": manual_flags,

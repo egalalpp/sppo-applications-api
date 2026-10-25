@@ -20,7 +20,8 @@ from pymongo.errors import PyMongoError
 
 from app.cache import app_status_keys
 from app.config import get_settings
-from app.db import APPLICATION_TYPES, APPLICATIONS, utcnow
+from app import audit
+from app.db import APPLICATION_TYPES, APPLICATIONS, AUDIT_LOGS, utcnow
 from app.domain import OcrState
 from app import storage
 from app.services import mailer, ocr
@@ -73,15 +74,33 @@ def _find_duplicates(app: dict) -> dict:
         ).limit(20)
         files = [str(d["_id"]) for d in cursor]
 
+    # Дубли счёта и паспорта ищутся по HMAC-хэшам (services/hashing.py), а не по сырым значениям
     payout = []
-    account = app.get("payout", {}).get("account_number")
-    if account:
+    account_hash = (app.get("payout") or {}).get("account_number_hash")
+    if account_hash:
         cursor = db[APPLICATIONS].find(
-            {**others, "period": app["period"], "payout.account_number": account}, {"_id": 1}
+            {**others, "period": app["period"], "payout.account_number_hash": account_hash}, {"_id": 1}
         ).limit(20)
         payout = [str(d["_id"]) for d in cursor]
 
-    return {"files": files, "payout": payout}
+    passport = []
+    passport_hash = (app.get("student") or {}).get("passport_hash")
+    if passport_hash:
+        cursor = db[APPLICATIONS].find(
+            {**others, "period": app["period"], "student.passport_hash": passport_hash}, {"_id": 1}
+        ).limit(20)
+        passport = [str(d["_id"]) for d in cursor]
+
+    return {"files": files, "payout": payout, "passport": passport}
+
+
+def _audit(event_type: str, app_id: ObjectId, details: dict) -> None:
+    """Событие системы в журнал аудита. Сбой журнала не должен ронять обработку заявки."""
+    try:
+        event = audit.build_event(audit.system_actor("ocr-worker"), event_type, "application", app_id, details)
+        _db()[AUDIT_LOGS].insert_one(event)
+    except Exception:  # noqa: BLE001
+        log.exception("Audit event %s for %s was not saved", event_type, app_id)
 
 
 def _ocr_settings() -> ocr.OcrSettings:
@@ -111,7 +130,8 @@ def _ocr_attachment(app_id: ObjectId, att: dict, cfg: ocr.OcrSettings) -> tuple[
                   "notes": [], "finished_at": now}
     _db()[APPLICATIONS].update_one(
         {"_id": app_id, "attachments.attachment_id": att["attachment_id"]},
-        {"$set": {"attachments.$.ocr": result}},
+        # ocr.updated_at — «пульс» долгой задачи: подметальщик не примет её за зависшую
+        {"$set": {"attachments.$.ocr": result, "ocr.updated_at": utcnow()}},
     )
     return result, text
 
@@ -177,6 +197,8 @@ def process_application(self, application_id: str) -> dict:
         }},
     )
     _cache().delete(*app_status_keys(application_id))
+    _audit(audit.OCR_FAILED if failed else audit.OCR_DONE, app_id,
+           {"state": state, "accuracy": accuracy, "failed_attachments": failed, "task_id": task_id})
     return {"application_id": application_id, "ocr_state": state, "accuracy": accuracy, "failed_attachments": failed}
 
 

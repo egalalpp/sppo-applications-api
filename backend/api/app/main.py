@@ -1,5 +1,6 @@
 """Точка входа FastAPI. Документация: /redoc, схема: /openapi.json."""
 
+import asyncio
 import uuid
 from contextlib import asynccontextmanager
 
@@ -9,9 +10,11 @@ from fastapi.openapi.docs import get_redoc_html
 from fastapi.openapi.utils import get_openapi
 
 from app import cache, db, errors
+from app.context import request_id_var
 from app.config import get_settings
 from app.routers import admin, applications, attachments, auth, benefit_types, operator, system
 from app.schemas import Problem
+from app.services.ocr_queue import run_sweeper
 
 API_PREFIX = "/api/v1"
 # Версия закреплена: redoc@next, который FastAPI подключает по умолчанию, не грузится в браузере.
@@ -34,7 +37,12 @@ DESCRIPTION = """
 async def lifespan(app: FastAPI):
     await db.connect()
     await cache.connect()
+    # Подметальщик ставит в очередь распознавания заявки, которые не попали туда при отправке
+    sweeper = asyncio.create_task(run_sweeper()) if get_settings().sweeper_enabled else None
     yield
+    if sweeper:
+        sweeper.cancel()
+        await asyncio.gather(sweeper, return_exceptions=True)
     await cache.close()
     await db.close()
 
@@ -62,6 +70,7 @@ def create_app() -> FastAPI:
     async def request_context(request: Request, call_next):
         # X-Instance показывает, какая реплика ответила — видно работу балансировщика nginx.
         request_id = request.headers.get("x-request-id") or uuid.uuid4().hex
+        request_id_var.set(request_id)  # попадёт в журнал аудита
         response = await call_next(request)
         response.headers["X-Request-ID"] = request_id
         response.headers["X-Instance"] = system.INSTANCE

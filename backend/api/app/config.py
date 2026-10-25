@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     mongo_db: str = "sppo"
     mongo_app_user: str | None = None
     mongo_app_password: str | None = None
+    # Имя replica set для сборной строки подключения (docker compose: rs0). Транзакции работают только на
+    # replica set; если его нет, приложение пишет без транзакций (см. db.run_in_transaction).
+    mongo_replica_set: str | None = None
 
     # Redis: db 0 — кэш, db 1 — брокер Celery, db 2 — результаты задач
     redis_dsn: str | None = Field(default=None, validation_alias=AliasChoices("redis_url"))
@@ -43,6 +46,9 @@ class Settings(BaseSettings):
 
     # JWT
     jwt_secret: str = Field(min_length=32)
+    # Секрет для HMAC-хэшей паспорта и счёта (services/hashing.py). Разный для dev, альфы и прода;
+    # в базе и в репозитории его быть не должно.
+    hash_pepper: str = Field(min_length=16)
     jwt_algorithm: str = "HS256"
     access_token_ttl_min: int = 30
     refresh_token_ttl_days: int = 7
@@ -75,6 +81,11 @@ class Settings(BaseSettings):
     max_queue_length: int = 50_000  # K из модели M/M/c/K (PD.ipynb)
     benefit_types_cache_ttl_sec: int = 3600
     status_cache_ttl_sec: int = 5
+    # «Подметальщик»: раз в sweep_interval_sec ставит в очередь распознавания заявки, которые не попали
+    # туда при отправке (брокер был недоступен или очередь переполнена) или потерялись из очереди.
+    sweeper_enabled: bool = True
+    sweep_interval_sec: int = 30
+    sweep_batch_size: int = 20
 
     # OCR (Tesseract)
     ocr_enabled: bool = True
@@ -116,6 +127,7 @@ class Settings(BaseSettings):
         return (
             f"mongodb://{user}:{password}@{self.mongo_host}:{self.mongo_port}/"
             f"{self.mongo_db}?authSource={self.mongo_db}"
+            + (f"&replicaSet={self.mongo_replica_set}" if self.mongo_replica_set else "")
         )
 
     def redis_url(self, db: int) -> str:

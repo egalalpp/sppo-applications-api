@@ -13,11 +13,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /srv
 
-# Tesseract OCR с русским (rus) и английским (eng) языковыми пакетами.
+# Tesseract OCR с русским (rus) и английским (eng) языковыми пакетами; poppler-utils (pdftoppm, pdfinfo) —
+# для pdf2image: разворот PDF в картинки перед распознаванием.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-rus tesseract-ocr-eng \
+    && apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-rus tesseract-ocr-eng poppler-utils \
     && rm -rf /var/lib/apt/lists/* \
-    && tesseract --list-langs
+    && tesseract --list-langs \
+    && pdftoppm -v
 
 COPY requirements.txt .
 RUN pip install -r requirements.txt

@@ -7,7 +7,13 @@
 разбирает проверки и одобряет; студент получает письма «принята» и «одобрена».
 Сценарий B: одно вложение не читается (сбой OCR) — заявка всё равно открывается у оператора,
 распознавание можно перезапустить, оператор отклоняет заявку с причиной.
+Сценарий C: очередь оператора сортируется по приоритету основания, затем по времени подачи.
+Журнал аудита (audit_logs) содержит события студента, оператора и системы.
 Всё время проверяется, что студент не видит ничего, связанного с распознаванием.
+
+С флагом --chaos добавляется сценарий D: пока Redis (очередь) остановлен, студент всё равно отправляет
+заявку и получает 202, а после запуска Redis подметальщик сам ставит заявку на распознавание.
+Для него нужен docker compose в PATH; тест останавливает и снова запускает сервис redis.
 
 Файлы для загрузки — учебные образцы с вымышленными данными из scripts/fixtures
 (создаются скриптом make_fixtures.py). Письма читаются из Mailpit; если он недоступен,
@@ -16,6 +22,8 @@
 
 import argparse
 import json
+import shutil
+import subprocess
 import sys
 import time
 import urllib.error
@@ -34,7 +42,9 @@ RUN = uuid.uuid4().bytes  # хвост после PNG-данных: у кажд�
 
 # Всё, что относится к распознаванию: студенту такие поля показывать нельзя
 OCR_KEYS = {"ocr", "checks", "processing", "accuracy", "ocr_state", "ocr_accuracy", "confidence",
-            "text_preview", "seal", "signature", "engine", "task_id", "notes"}
+            "text_preview", "seal", "signature", "engine", "task_id", "notes",
+            # служебные поля, которых у студента тоже быть не должно
+            "priority", "passport_hash", "account_number_hash"}
 
 
 class Api:
@@ -203,11 +213,65 @@ class Mailbox:
         fail(f"письмо «{subject_part}» для {to} не пришло за {timeout} с")
 
 
+def compose(*command):
+    docker = shutil.which("docker")
+    if not docker:
+        fail("--chaos: docker не найден в PATH")
+    result = subprocess.run([docker, "compose", *command], cwd=ROOT, capture_output=True, text=True)
+    if result.returncode:
+        fail(f"docker compose {' '.join(command)}: {result.stderr.strip()}")
+
+
+def chaos_scenario(api, admin, operator):
+    """Очередь (Redis) «спит»: студент не должен этого заметить, а заявка не должна потеряться."""
+    print("\n--- Сценарий D: Redis остановлен ---")
+    email, student = new_student(api, "student-chaos")
+    _, app, _ = api.call("POST", "/api/v1/applications", token=student, json_body=application_body("dormitory", email),
+                         expect=201)
+    app_id = app["id"]
+    for doc_type, name in (("passport_registration", "passport.png"), ("union_card", "certificate.png"),
+                           ("bank_requisites_screenshot", "bank.png")):
+        upload(api, student, app_id, doc_type, fixture(name, "chaos" + doc_type), name)
+
+    compose("stop", "redis")
+    try:
+        note("Redis остановлен: очередь недоступна")
+        started = time.time()
+        status, submitted, _ = api.call("POST", f"/api/v1/applications/{app_id}/submit", token=student)
+        elapsed = time.time() - started
+        if status != 202 or submitted != {"id": app_id, "status": "pending"}:
+            fail(f"отправка при остановленной очереди: {status} {submitted}")
+        _, view, _ = api.call("GET", f"/api/v1/applications/{app_id}/status", token=student, expect=200)
+        if view["status"] != "pending":
+            fail(f"студент видит {view}")
+        assert_student_blind(view, "статус при остановленной очереди")
+        ok(f"студент отправил заявку при остановленной очереди за {elapsed:.1f} с: 202 и статус pending, без 503")
+        _, op_view, _ = api.call("GET", f"/api/v1/applications/{app_id}", token=operator, expect=200)
+        if op_view["ocr"]["state"] != "not_started":
+            fail(f"ожидали ocr.state=not_started, получили {op_view['ocr']}")
+        ok("оператор видит заявку: распознавание ещё не поставлено в очередь (ocr.state=not_started)")
+    finally:
+        compose("start", "redis")
+    note("Redis запущен: жду, пока подметальщик поставит заявку на распознавание")
+
+    st = wait_ocr(api, operator, app_id, {"ready_for_review", "ocr_failed"}, timeout=240)
+    if st["ocr"]["state"] != "ready_for_review":
+        fail(f"после возвращения Redis: {st['ocr']}")
+    _, found, _ = api.call("GET", f"/api/v1/admin/audit-logs?resource_id={app_id}&event_type=ocr_queued", token=admin,
+                           expect=200)
+    queued_by = {e["actor"]["id"] for e in found["items"]}
+    if "sweeper" not in queued_by:
+        fail(f"заявку поставил не подметальщик: {queued_by}")
+    ok("подметальщик поставил заявку в очередь сам, воркер её распознал: ocr.state=ready_for_review")
+
+
 def main():
     parser = argparse.ArgumentParser()
     env = read_env()
     parser.add_argument("--base-url", default=f"http://localhost:{env.get('HTTP_PORT', '8000')}")
     parser.add_argument("--mailpit-url", default="http://localhost:8025")
+    parser.add_argument("--chaos", action="store_true",
+                        help="сценарий D: остановить Redis на время отправки заявки (нужен docker compose)")
     args = parser.parse_args()
     api, mailbox = Api(args.base_url), Mailbox(args.mailpit_url)
 
@@ -409,7 +473,7 @@ def main():
     ok("студент по-прежнему видит просто «на рассмотрении»")
 
     _, restart, _ = api.call("POST", f"/api/v1/applications/{b_id}/ocr/restart", token=operator, expect=202)
-    if restart["ocr"]["state"] != "queued":
+    if restart["ocr"]["state"] not in ("queued", "running"):  # воркер мог подхватить задачу ещё до ответа
         fail(f"перезапуск OCR: {restart}")
     wait_ocr(api, operator, b_id, {"ocr_failed"})
     ok("«Перезапустить OCR»: задача поставлена в очередь и отработала (скан по-прежнему битый — снова ocr_failed)")
@@ -430,14 +494,69 @@ def main():
     api.call("POST", "/api/v1/applications", token=student_b, json_body=application_body("dormitory", email_b), expect=201)
     ok("после отказа студент может подать новую заявку по тому же основанию")
 
-    # ---------- Журнал и статистика ----------
-    _, events, _ = api.call("GET", f"/api/v1/admin/audit-events?target_id={b_id}", token=admin, expect=200)
-    actions = {e["action"] for e in events["items"]}
-    if "application.ocr_restart" not in actions:
-        fail(f"в журнале нет перезапуска OCR: {actions}")
-    ok(f"журнал аудита по заявке B: {sorted(actions)}")
+    # ======================= Сценарий C =======================
+    print("\n--- Сценарий C: очередь оператора по приоритету основания ---")
+    # dormitory (приоритет 12) подаём первой и ещё раз последней, disabled (приоритет 2) — посередине
+    queued = []
+    for label, basis, extra_doc in (("c-dorm-1", "dormitory", None), ("c-disabled", "disabled", "disability_certificate"),
+                                    ("c-dorm-2", "dormitory", None)):
+        email_c, token_c = new_student(api, label)
+        _, app_c, _ = api.call("POST", "/api/v1/applications", token=token_c,
+                               json_body=application_body(basis, email_c), expect=201)
+        for doc_type, name in (("passport_registration", "passport.png"), ("union_card", "certificate.png"),
+                               ("bank_requisites_screenshot", "bank.png")) + (((extra_doc, "certificate.png"),) if extra_doc else ()):
+            upload(api, token_c, app_c["id"], doc_type, fixture(name, label + doc_type), name)
+        api.call("POST", f"/api/v1/applications/{app_c['id']}/submit", token=token_c, expect=202)
+        queued.append((app_c["id"], basis, token_c))
+        time.sleep(1.1)  # submitted_at различается хотя бы на секунду
+    _, queue, _ = api.call("GET", "/api/v1/operator/queue?limit=100", token=operator, expect=200)
+    order = [i["id"] for i in queue["items"] if i["id"] in {q[0] for q in queued}]
+    expected_order = [queued[1][0], queued[0][0], queued[2][0]]  # disabled(2), затем dormitory в порядке подачи
+    if order != expected_order:
+        fail(f"порядок очереди {order}, ожидали {expected_order}")
+    items = {i["id"]: i for i in queue["items"]}
+    if [items[i]["priority"] for i in order] != [2, 12, 12]:
+        fail(f"приоритеты в очереди: {[items[i]['priority'] for i in order]}")
+    ok("очередь: сначала disabled (приоритет 2), затем dormitory (12) в порядке подачи; оператор видит priority")
+    for app_c, _, token_c in queued:
+        _, view, _ = api.call("GET", f"/api/v1/applications/{app_c}", token=token_c, expect=200)
+        assert_student_blind(view, "заявка студента (приоритет и хэши скрыты)")
+    ok("студент не видит priority и хэши паспорта и счёта")
+
+    # ---------- Журнал аудита ----------
+    def events_for(resource_id):
+        _, found, _ = api.call("GET", f"/api/v1/admin/audit-logs?resource_id={resource_id}&limit=100", token=admin, expect=200)
+        return list(reversed(found["items"]))  # от старых к новым
+
+    log_a = events_for(app_id)
+    types_a = [e["eventType"] for e in log_a]
+    expected = ["claim_created", "attachment_uploaded", "claim_submitted", "ocr_queued", "ocr_done",
+                "claim_review_started", "check_set", "claim_approved"]
+    remaining = iter(types_a)
+    if not all(event in remaining for event in expected):  # проверка «подпоследовательности»: события идут в этом порядке
+        fail(f"журнал заявки A: {types_a}")
+    by_type = {e["eventType"]: e for e in log_a}
+    if by_type["claim_submitted"]["actor"]["type"] != "student" or by_type["ocr_done"]["actor"] != {
+            "type": "system", "id": "ocr-worker", "role": "system", "email": None}:
+        fail(f"актёры в журнале: {by_type['claim_submitted']['actor']}, {by_type['ocr_done']['actor']}")
+    approved = by_type["claim_approved"]
+    if approved["actor"]["type"] != "operator" or approved["details"].get("to") != "approved" or not approved.get("request_id"):
+        fail(f"claim_approved: {approved}")
+    ok(f"журнал аудита заявки A ({len(log_a)} событий): " + ", ".join(dict.fromkeys(types_a)))
+
+    log_b = events_for(b_id)
+    types_b = [e["eventType"] for e in log_b]
+    rejected = next((e for e in log_b if e["eventType"] == "claim_rejected"), None)
+    if "ocr_failed" not in types_b or "ocr_restarted" not in types_b or not rejected:
+        fail(f"журнал заявки B: {types_b}")
+    if rejected["details"]["rejection_reason"] != reason or rejected["details"]["from"] != "in_review":
+        fail(f"claim_rejected: {rejected['details']}")
+    ok(f"журнал аудита заявки B: ocr_failed, ocr_restarted и claim_rejected с причиной отказа ({len(log_b)} событий)")
     _, stats, _ = api.call("GET", "/api/v1/admin/stats", token=admin, expect=200)
     ok(f"статистика: {stats['applications_by_status']}, роли {stats['users_by_role']}, очередь {stats['queue_length']}")
+
+    if args.chaos:
+        chaos_scenario(api, admin, operator)
 
     print("\nВсё работает.")
 

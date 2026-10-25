@@ -80,6 +80,8 @@ class RequiredSlot(Strict):
 class BenefitTypeBase(Strict):
     title: str = Field(min_length=3, max_length=200)
     form_no: int | None = Field(default=None, ge=1)
+    priority: int = Field(default=100, ge=1, description="Меньше число — выше приоритет: очередь оператора "
+                                                         "сортируется по нему. По умолчанию как номер бланка")
     requires: list[RequiredSlot] = []
     manual_flags: list[str] = []
     is_active: bool = True
@@ -126,11 +128,22 @@ class PayoutIn(Strict):
     account_number: str = Field(pattern=r"^\d{20}$")
 
 
-class FormIn(Strict):
-    applicant_signed: bool = False
-    signed_date: date | None = None
+class FormIn(BaseModel):
+    """Электронная форма заявления: подписи студента нет, есть согласие на обработку ПДн.
+
+    Поля прежних версий (applicant_signed, signed_date, dorm_head_signed) принимаются и игнорируются:
+    так клиент, который ещё их присылает, не получит 422. Подпись заведующего общежитием ставит оператор.
+    """
+    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
+
     consent_pd_signed: bool = Field(default=False, description="Согласие на обработку ПДн (152-ФЗ)")
-    dorm_head_signed: bool | None = None
+    consent_text_version: str | None = Field(default=None, max_length=50, examples=["2026-09"],
+                                             description="Версия текста согласия, который видел студент")
+
+
+class FormOut(FormIn):
+    consent_pd_at: datetime | None = Field(default=None, description="Когда дано согласие (ставит сервер)")
+    dorm_head_signed: bool | None = Field(default=None, description="Подпись заведующего общежитием (ставит оператор)")
 
 
 class ApplicationCreate(Strict):
@@ -214,13 +227,15 @@ class ApplicationOut(BaseModel):
     basis: str
     student: StudentIn
     payout: PayoutIn
-    form: FormIn
+    form: FormOut
     attachments: list[AttachmentOut]
     status: AppStatus
     rejection_reason: str | None = Field(default=None, description="Причина отказа (при статусе rejected)")
+    submitted_at: datetime | None = Field(default=None, description="Когда заявка отправлена на рассмотрение")
     created_at: datetime
     updated_at: datetime
     # Только для оператора и администратора; студент этих полей не получает
+    priority: int | None = Field(default=None, description="Приоритет основания на момент создания заявки")
     checks: list[CheckOut] | None = None
     ocr: OcrOut | None = None
 
@@ -234,9 +249,11 @@ class ApplicationSummary(BaseModel):
     student_full_name: str
     institute: str
     group: str
+    submitted_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
     # Только для оператора и администратора
+    priority: int | None = Field(default=None, description="Меньше число — выше приоритет")
     ocr_state: OcrState | None = None
     ocr_accuracy: int | None = None
 
@@ -292,16 +309,26 @@ class TaskOut(BaseModel):
 
 # ---------- Админка ----------
 
-class AuditEventOut(BaseModel):
+class AuditActor(BaseModel):
+    type: str = Field(description="student | operator | admin | system")
     id: str
-    at: datetime
-    actor_id: str
-    actor_email: str
-    actor_role: str
-    action: str
-    target_type: str
-    target_id: str
+    role: str
+    email: str | None = None
+
+
+class AuditResource(BaseModel):
+    type: str
+    id: str
+
+
+class AuditLogOut(BaseModel):
+    id: str
+    eventType: str
+    actor: AuditActor
+    resource: AuditResource
+    timestamp: datetime
     details: dict
+    request_id: str | None = None
 
 
 class StatsOut(BaseModel):

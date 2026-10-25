@@ -8,7 +8,7 @@ import pytest
 from app.config import Settings
 from app.services import mailer
 
-BASE = dict(jwt_secret="x" * 32, s3_access_key="a", s3_secret_key="b", mongo_app_user="u",
+BASE = dict(jwt_secret="x" * 32, hash_pepper="p" * 16, s3_access_key="a", s3_secret_key="b", mongo_app_user="u",
             mongo_app_password="p", redis_password="r")
 
 

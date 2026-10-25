@@ -92,6 +92,8 @@ async def upload_attachment(
     if result.modified_count == 0:
         await run_in_threadpool(storage.delete_object, key)
         raise ApiError(409, "Заявка изменилась во время загрузки, повторите")
+    await audit.log(user, audit.ATTACHMENT_UPLOADED, "application", app_id, {
+        "attachment_id": attachment_id, "type": type, "size_bytes": len(data), "sha256": attachment["storage"]["sha256"]})
     return attachment_out(attachment)
 
 
@@ -114,7 +116,7 @@ async def download_url(app_id: str, attachment_id: str, user: dict = Depends(get
     url = storage.presigned_get_url(att["storage"]["key"], f"{att['type']}.{ext}")
     if is_staff(user):
         # Доступ сотрудника к персональным данным фиксируется в журнале.
-        await audit.log(user, "attachment.download_url", "application", app_id,
+        await audit.log(user, audit.SCAN_VIEWED, "application", app_id,
                         {"attachment_id": attachment_id, "type": att["type"]})
     return {"url": url, "expires_in": get_settings().presigned_ttl_sec}
 
@@ -132,4 +134,6 @@ async def delete_attachment(app_id: str, attachment_id: str, user: dict = Depend
     if result.modified_count == 0:
         raise ApiError(409, f"В статусе {doc['status']} менять вложения нельзя")
     await run_in_threadpool(storage.delete_object, att["storage"]["key"])
+    await audit.log(user, audit.ATTACHMENT_REMOVED, "application", app_id,
+                    {"attachment_id": attachment_id, "type": att["type"]})
     return Response(status_code=204)

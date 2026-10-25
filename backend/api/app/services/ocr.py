@@ -20,6 +20,7 @@ import cv2
 import numpy as np
 import pypdfium2 as pdfium
 import pytesseract
+from pdf2image import convert_from_bytes
 from PIL import Image, ImageOps, ImageStat
 
 from app.services import marks, ocr_fields
@@ -58,21 +59,45 @@ def _downscale(img: Image.Image, max_side: int) -> Image.Image:
     return img.resize((max(1, round(img.width * scale)), max(1, round(img.height * scale))), Image.LANCZOS)
 
 
+def _render_pdf_poppler(data: bytes, cfg: OcrSettings) -> list[Image.Image]:
+    """PDF -> страницы через poppler (pdftoppm, пакет poppler-utils). size=int — длинная сторона в пикселях."""
+    pages = convert_from_bytes(
+        data, first_page=1, last_page=cfg.max_pdf_pages, size=cfg.max_side_px, fmt="png",
+        thread_count=1, timeout=cfg.timeout_sec,
+    )
+    return [page.convert("RGB") for page in pages]
+
+
+def _render_pdf_pdfium(data: bytes, cfg: OcrSettings) -> list[Image.Image]:
+    """Запасной рендер без внешних программ: pypdfium2 (pdfium встроен в колесо)."""
+    pdf = pdfium.PdfDocument(data)
+    try:
+        pages = []
+        for index in range(min(len(pdf), cfg.max_pdf_pages)):
+            page = pdf[index]
+            width, height = page.get_size()
+            pages.append(page.render(scale=cfg.max_side_px / max(width, height)).to_pil().convert("RGB"))
+            page.close()
+        return pages
+    finally:
+        pdf.close()
+
+
+def _render_pdf(data: bytes, cfg: OcrSettings) -> list[Image.Image]:
+    """Сначала poppler; если его нет или он не смог прочитать файл — pdfium.
+    Если не справились оба, исключение уходит наверх (файл битый или зашифрован)."""
+    try:
+        return _render_pdf_poppler(data, cfg)
+    except Exception as exc:  # noqa: BLE001 — poppler не установлен, таймаут, битая структура
+        log.warning("poppler could not render the PDF (%s), falling back to pdfium", type(exc).__name__)
+        return _render_pdf_pdfium(data, cfg)
+
+
 def load_pages(data: bytes, content_type: str, cfg: OcrSettings) -> list[Image.Image]:
     """Страницы документа как RGB-картинки, уменьшенные до cfg.max_side_px по длинной стороне."""
     try:
         if content_type == "application/pdf":
-            pdf = pdfium.PdfDocument(data)
-            try:
-                pages = []
-                for index in range(min(len(pdf), cfg.max_pdf_pages)):
-                    page = pdf[index]
-                    width, height = page.get_size()
-                    image = page.render(scale=cfg.max_side_px / max(width, height)).to_pil()
-                    pages.append(image.convert("RGB"))
-                    page.close()
-            finally:
-                pdf.close()
+            pages = _render_pdf(data, cfg)
             if not pages:
                 raise OcrError("В PDF нет страниц")
             return pages

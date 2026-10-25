@@ -154,6 +154,13 @@ def build_auto_checks(app: dict, benefit_type: dict, duplicates: dict, now: date
         CheckStatus.needs_review if dup_payout else CheckStatus.auto_ok, now,
         details={"application_ids": dup_payout} if dup_payout else None,
     ))
+
+    dup_passport = duplicates.get("passport", [])
+    checks.append(_check(
+        "duplicate_passport", "auto",
+        CheckStatus.needs_review if dup_passport else CheckStatus.auto_ok, now,
+        details={"application_ids": dup_passport} if dup_passport else None,
+    ))
     return checks
 
 

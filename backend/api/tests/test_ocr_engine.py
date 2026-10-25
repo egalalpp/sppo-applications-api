@@ -150,3 +150,42 @@ def test_phone_photo_quality_is_tolerated(params):
     _, bank_text = ocr.analyze(degraded(bank, **params), "image/jpeg", "bank_requisites_screenshot", CFG)
     assert ocr_fields.compare_passport(passport_text, "4510", "123456")[0] == "ok", params
     assert ocr_fields.compare_bank(bank_text, "044525225", "40817810000000000001")[0] == "ok", params
+
+
+def _pdf(pages: int = 1) -> bytes:
+    images = [page(lines=PASSPORT_LINES, size=42)[0] for _ in range(pages)]
+    buf = io.BytesIO()
+    images[0].save(buf, "PDF", resolution=150, save_all=True, append_images=images[1:])
+    return buf.getvalue()
+
+
+@pytest.mark.skipif(not shutil.which("pdftoppm"), reason="нужен poppler-utils")
+def test_pdf_is_rendered_by_poppler_via_pdf2image(monkeypatch):
+    """Основной рендер PDF — poppler (pdf2image); запасной pdfium при этом не вызывается."""
+    def boom(*args, **kwargs):
+        raise AssertionError("pdfium не должен вызываться, пока работает poppler")
+
+    monkeypatch.setattr(ocr, "_render_pdf_pdfium", boom)
+    pages = ocr.load_pages(_pdf(), "application/pdf", ocr.OcrSettings(max_side_px=1600))
+    assert len(pages) == 1 and max(pages[0].size) == 1600  # size=int -> длинная сторона в пикселях
+    result, text = ocr.analyze(_pdf(), "application/pdf", "passport_registration", CFG)
+    assert "ИВАНОВ" in text.upper() and result["pages"] == 1
+
+
+def test_pdf_falls_back_to_pdfium_when_poppler_fails(monkeypatch):
+    def broken(*args, **kwargs):
+        raise OSError("pdftoppm is missing")
+
+    monkeypatch.setattr(ocr, "_render_pdf_poppler", broken)
+    result, text = ocr.analyze(_pdf(), "application/pdf", "passport_registration", CFG)
+    assert "ИВАНОВ" in text.upper() and result["pages"] == 1
+
+
+def test_pdf_unreadable_by_both_renderers_is_an_ocr_error():
+    with pytest.raises(ocr.OcrError):
+        ocr.load_pages(b"%PDF-1.4\n garbage without structure", "application/pdf", CFG)
+
+
+def test_pdf_page_limit():
+    pages = ocr.load_pages(_pdf(pages=5), "application/pdf", ocr.OcrSettings(max_pdf_pages=3))
+    assert len(pages) == 3

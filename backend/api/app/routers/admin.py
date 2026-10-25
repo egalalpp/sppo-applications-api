@@ -11,7 +11,7 @@ from app.deps import require_admin
 from app.domain import Role
 from app.errors import ApiError, responses
 from app.schemas import (
-    AuditEventOut,
+    AuditLogOut,
     BenefitTypeBase,
     BenefitTypeIn,
     BenefitTypeOut,
@@ -56,10 +56,10 @@ async def list_users(
 
 
 @router.post("/users", response_model=UserOut, status_code=201, responses=responses(409, 422),
-             summary="Создать пользователя с любой ролью (например, модератора)")
+             summary="Создать пользователя с любой ролью (например, оператора)")
 async def create_user_by_admin(body: UserCreate, admin: dict = Depends(require_admin)):
     user = await create_user(body.email, body.password, body.full_name, body.role, created_by=admin["_id"])
-    await audit.log(admin, "user.create", "user", user["_id"], {"email": user["email"], "role": user["role"]})
+    await audit.log(admin, audit.USER_CREATED, "user", user["_id"], {"email": user["email"], "role": user["role"]})
     return user_out(user)
 
 
@@ -97,7 +97,7 @@ async def update_user(user_id: str, body: UserUpdate, admin: dict = Depends(requ
         return_document=ReturnDocument.AFTER,
     )
     before = {k: target.get(k) for k in changes}
-    await audit.log(admin, "user.update", "user", target["_id"], {"before": before, "after": changes})
+    await audit.log(admin, audit.USER_UPDATED, "user", target["_id"], {"before": before, "after": changes})
     return user_out(updated)
 
 
@@ -113,7 +113,7 @@ async def create_benefit_type(body: BenefitTypeIn, admin: dict = Depends(require
     if result.upserted_id is None:
         raise ApiError(409, f"Основание {body.code} уже существует")
     await benefit_types.invalidate()
-    await audit.log(admin, "benefit_type.create", "benefit_type", body.code, data)
+    await audit.log(admin, audit.BENEFIT_TYPE_CREATED, "benefit_type", body.code, data)
     return benefit_type_out({"_id": body.code, **data})
 
 
@@ -122,13 +122,15 @@ async def create_benefit_type(body: BenefitTypeIn, admin: dict = Depends(require
 async def update_benefit_type(code: str, body: BenefitTypeBase, admin: dict = Depends(require_admin)):
     coll = db.get_db()[db.APPLICATION_TYPES]
     data = body.model_dump()
+    if "priority" not in body.model_fields_set:
+        data.pop("priority")  # приоритет не передан — остаётся прежним, а не сбрасывается в значение по умолчанию
     updated = await coll.find_one_and_update(
         {"_id": code}, {"$set": {**data, "updated_at": db.utcnow()}}, return_document=ReturnDocument.AFTER
     )
     if updated is None:
         raise ApiError(404, "Основание не найдено")
     await benefit_types.invalidate()
-    await audit.log(admin, "benefit_type.update", "benefit_type", code, data)
+    await audit.log(admin, audit.BENEFIT_TYPE_UPDATED, "benefit_type", code, data)
     return benefit_type_out(updated)
 
 
@@ -140,32 +142,33 @@ async def disable_benefit_type(code: str, admin: dict = Depends(require_admin)):
     if result.matched_count == 0:
         raise ApiError(404, "Основание не найдено")
     await benefit_types.invalidate()
-    await audit.log(admin, "benefit_type.disable", "benefit_type", code)
+    await audit.log(admin, audit.BENEFIT_TYPE_DISABLED, "benefit_type", code)
     return Response(status_code=204)
 
 
 # ---------- Журнал и статистика ----------
 
-@router.get("/audit-events", response_model=Page[AuditEventOut], summary="Журнал действий сотрудников")
-async def list_audit_events(
-    actor_id: str | None = None,
-    action: str | None = None,
-    target_type: str | None = None,
-    target_id: str | None = None,
+@router.get("/audit-logs", response_model=Page[AuditLogOut], summary="Журнал аудита (audit_logs)",
+            description="Плоская схема: eventType, actor, resource, timestamp, details. Новые события сверху.")
+async def list_audit_logs(
+    actor_id: str | None = Query(default=None, description="actor.id: id пользователя или имя системного актора"),
+    event_type: str | None = Query(default=None, description="eventType, например claim_rejected"),
+    resource_type: str | None = None,
+    resource_id: str | None = Query(default=None, description="resource.id, например id заявки"),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ):
     query: dict = {}
     if actor_id:
-        query["actor_id"] = db.parse_oid(actor_id)
-    if action:
-        query["action"] = action
-    if target_type:
-        query["target_type"] = target_type
-    if target_id:
-        query["target_id"] = target_id
-    coll = db.get_db()[db.AUDIT_EVENTS]
-    cursor = coll.find(query).sort("at", -1).skip(offset).limit(limit)
+        query["actor.id"] = actor_id
+    if event_type:
+        query["eventType"] = event_type
+    if resource_type:
+        query["resource.type"] = resource_type
+    if resource_id:
+        query["resource.id"] = resource_id
+    coll = db.get_db()[db.AUDIT_LOGS]
+    cursor = coll.find(query).sort("timestamp", -1).skip(offset).limit(limit)
     items = [audit_out(e) async for e in cursor]
     return {"items": items, "total": await coll.count_documents(query), "limit": limit, "offset": offset}
 

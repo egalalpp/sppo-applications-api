@@ -503,8 +503,9 @@ paths:
       summary: Отправить заявку на рассмотрение
       description: 'Доступно, когда заполнена форма, есть согласие на обработку ПДн
         и приложены все документы из списка для выбранного основания (в интерфейсе
-        в этот момент разблокируется кнопка). Ответ 202: заявка принята, о результате
-        студент узнает по статусу и из письма.'
+        в этот момент разблокируется кнопка). Ответ 202: заявка принята и ждёт оператора,
+        о результате студент узнает по статусу и из письма. Отправка не зависит от
+        состояния очереди и воркеров.'
       operationId: submit_application_api_v1_applications__app_id__submit_post
       security:
       - OAuth2PasswordBearer: []
@@ -536,12 +537,6 @@ paths:
                 $ref: '#/components/schemas/Problem'
         '422':
           description: Unprocessable Content
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Problem'
-        '503':
-          description: Service Unavailable
           content:
             application/problem+json:
               schema:
@@ -841,10 +836,11 @@ paths:
     get:
       tags:
       - operator
-      summary: 'Очередь оператора (FIFO: сначала старые заявки)'
-      description: 'В каждой заявке — ocr_state (ready_for_review, ocr_failed, ...)
-        и ocr_accuracy, %. Заявки с ocr_failed тоже открываются: распознавание можно
-        перезапустить.'
+      summary: 'Очередь оператора: по приоритету основания, затем по времени подачи'
+      description: 'Сначала заявки с меньшим `priority` (выше приоритет), внутри одного
+        приоритета — те, что поданы раньше. В каждой заявке — ocr_state (ready_for_review,
+        ocr_failed...) и ocr_accuracy, %. Заявки с ocr_failed тоже открываются: распознавание
+        можно перезапустить.'
       operationId: operator_queue_api_v1_operator_queue_get
       security:
       - OAuth2PasswordBearer: []
@@ -1132,7 +1128,7 @@ paths:
     post:
       tags:
       - admin
-      summary: Создать пользователя с любой ролью (например, модератора)
+      summary: Создать пользователя с любой ролью (например, оператора)
       operationId: create_user_by_admin_api_v1_admin_users_post
       security:
       - OAuth2PasswordBearer: []
@@ -1342,12 +1338,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
-  /api/v1/admin/audit-events:
+  /api/v1/admin/audit-logs:
     get:
       tags:
       - admin
-      summary: Журнал действий сотрудников
-      operationId: list_audit_events_api_v1_admin_audit_events_get
+      summary: Журнал аудита (audit_logs)
+      description: 'Плоская схема: eventType, actor, resource, timestamp, details.
+        Новые события сверху.'
+      operationId: list_audit_logs_api_v1_admin_audit_logs_get
       security:
       - OAuth2PasswordBearer: []
       parameters:
@@ -1358,31 +1356,37 @@ paths:
           anyOf:
           - type: string
           - type: 'null'
+          description: 'actor.id: id пользователя или имя системного актора'
           title: Actor Id
-      - name: action
+        description: 'actor.id: id пользователя или имя системного актора'
+      - name: event_type
         in: query
         required: false
         schema:
           anyOf:
           - type: string
           - type: 'null'
-          title: Action
-      - name: target_type
+          description: eventType, например claim_rejected
+          title: Event Type
+        description: eventType, например claim_rejected
+      - name: resource_type
         in: query
         required: false
         schema:
           anyOf:
           - type: string
           - type: 'null'
-          title: Target Type
-      - name: target_id
+          title: Resource Type
+      - name: resource_id
         in: query
         required: false
         schema:
           anyOf:
           - type: string
           - type: 'null'
-          title: Target Id
+          description: resource.id, например id заявки
+          title: Resource Id
+        description: resource.id, например id заявки
       - name: limit
         in: query
         required: false
@@ -1406,7 +1410,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Page_AuditEventOut_'
+                $ref: '#/components/schemas/Page_AuditLogOut_'
         '422':
           description: Validation Error
           content:
@@ -1477,7 +1481,6 @@ components:
         form:
           $ref: '#/components/schemas/FormIn'
           default:
-            applicant_signed: false
             consent_pd_signed: false
       additionalProperties: false
       type: object
@@ -1508,7 +1511,7 @@ components:
         payout:
           $ref: '#/components/schemas/PayoutIn'
         form:
-          $ref: '#/components/schemas/FormIn'
+          $ref: '#/components/schemas/FormOut'
         attachments:
           items:
             $ref: '#/components/schemas/AttachmentOut'
@@ -1522,6 +1525,13 @@ components:
           - type: 'null'
           title: Rejection Reason
           description: Причина отказа (при статусе rejected)
+        submitted_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Submitted At
+          description: Когда заявка отправлена на рассмотрение
         created_at:
           type: string
           format: date-time
@@ -1530,6 +1540,12 @@ components:
           type: string
           format: date-time
           title: Updated At
+        priority:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Priority
+          description: Приоритет основания на момент создания заявки
         checks:
           anyOf:
           - items:
@@ -1583,6 +1599,12 @@ components:
         group:
           type: string
           title: Group
+        submitted_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Submitted At
         created_at:
           type: string
           format: date-time
@@ -1591,6 +1613,12 @@ components:
           type: string
           format: date-time
           title: Updated At
+        priority:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Priority
+          description: Меньше число — выше приоритет
         ocr_state:
           anyOf:
           - $ref: '#/components/schemas/OcrState'
@@ -1744,49 +1772,76 @@ components:
       - sha256
       - uploaded_at
       title: AttachmentOut
-    AuditEventOut:
+    AuditActor:
+      properties:
+        type:
+          type: string
+          title: Type
+          description: student | operator | admin | system
+        id:
+          type: string
+          title: Id
+        role:
+          type: string
+          title: Role
+        email:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Email
+      type: object
+      required:
+      - type
+      - id
+      - role
+      title: AuditActor
+    AuditLogOut:
       properties:
         id:
           type: string
           title: Id
-        at:
+        eventType:
+          type: string
+          title: Eventtype
+        actor:
+          $ref: '#/components/schemas/AuditActor'
+        resource:
+          $ref: '#/components/schemas/AuditResource'
+        timestamp:
           type: string
           format: date-time
-          title: At
-        actor_id:
-          type: string
-          title: Actor Id
-        actor_email:
-          type: string
-          title: Actor Email
-        actor_role:
-          type: string
-          title: Actor Role
-        action:
-          type: string
-          title: Action
-        target_type:
-          type: string
-          title: Target Type
-        target_id:
-          type: string
-          title: Target Id
+          title: Timestamp
         details:
           additionalProperties: true
           type: object
           title: Details
+        request_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Request Id
       type: object
       required:
       - id
-      - at
-      - actor_id
-      - actor_email
-      - actor_role
-      - action
-      - target_type
-      - target_id
+      - eventType
+      - actor
+      - resource
+      - timestamp
       - details
-      title: AuditEventOut
+      title: AuditLogOut
+    AuditResource:
+      properties:
+        type:
+          type: string
+          title: Type
+        id:
+          type: string
+          title: Id
+      type: object
+      required:
+      - type
+      - id
+      title: AuditResource
     BenefitTypeBase:
       properties:
         title:
@@ -1800,6 +1855,13 @@ components:
             minimum: 1.0
           - type: 'null'
           title: Form No
+        priority:
+          type: integer
+          minimum: 1.0
+          title: Priority
+          description: 'Меньше число — выше приоритет: очередь оператора сортируется
+            по нему. По умолчанию как номер бланка'
+          default: 100
         requires:
           items:
             $ref: '#/components/schemas/RequiredSlot'
@@ -1834,6 +1896,13 @@ components:
             minimum: 1.0
           - type: 'null'
           title: Form No
+        priority:
+          type: integer
+          minimum: 1.0
+          title: Priority
+          description: 'Меньше число — выше приоритет: очередь оператора сортируется
+            по нему. По умолчанию как номер бланка'
+          default: 100
         requires:
           items:
             $ref: '#/components/schemas/RequiredSlot'
@@ -1875,6 +1944,13 @@ components:
             minimum: 1.0
           - type: 'null'
           title: Form No
+        priority:
+          type: integer
+          minimum: 1.0
+          title: Priority
+          description: 'Меньше число — выше приоритет: очередь оператора сортируется
+            по нему. По умолчанию как номер бланка'
+          default: 100
         requires:
           items:
             $ref: '#/components/schemas/RequiredSlot'
@@ -2055,29 +2131,62 @@ components:
       title: DownloadUrlOut
     FormIn:
       properties:
-        applicant_signed:
-          type: boolean
-          title: Applicant Signed
-          default: false
-        signed_date:
-          anyOf:
-          - type: string
-            format: date
-          - type: 'null'
-          title: Signed Date
         consent_pd_signed:
           type: boolean
           title: Consent Pd Signed
           description: Согласие на обработку ПДн (152-ФЗ)
           default: false
+        consent_text_version:
+          anyOf:
+          - type: string
+            maxLength: 50
+          - type: 'null'
+          title: Consent Text Version
+          description: Версия текста согласия, который видел студент
+          examples:
+          - 2026-09
+      type: object
+      title: FormIn
+      description: 'Электронная форма заявления: подписи студента нет, есть согласие
+        на обработку ПДн.
+
+
+        Поля прежних версий (applicant_signed, signed_date, dorm_head_signed) принимаются
+        и игнорируются:
+
+        так клиент, который ещё их присылает, не получит 422. Подпись заведующего
+        общежитием ставит оператор.'
+    FormOut:
+      properties:
+        consent_pd_signed:
+          type: boolean
+          title: Consent Pd Signed
+          description: Согласие на обработку ПДн (152-ФЗ)
+          default: false
+        consent_text_version:
+          anyOf:
+          - type: string
+            maxLength: 50
+          - type: 'null'
+          title: Consent Text Version
+          description: Версия текста согласия, который видел студент
+          examples:
+          - 2026-09
+        consent_pd_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Consent Pd At
+          description: Когда дано согласие (ставит сервер)
         dorm_head_signed:
           anyOf:
           - type: boolean
           - type: 'null'
           title: Dorm Head Signed
-      additionalProperties: false
+          description: Подпись заведующего общежитием (ставит оператор)
       type: object
-      title: FormIn
+      title: FormOut
     HTTPValidationError:
       properties:
         detail:
@@ -2200,11 +2309,11 @@ components:
       - limit
       - offset
       title: Page[ApplicationSummary]
-    Page_AuditEventOut_:
+    Page_AuditLogOut_:
       properties:
         items:
           items:
-            $ref: '#/components/schemas/AuditEventOut'
+            $ref: '#/components/schemas/AuditLogOut'
           type: array
           title: Items
         total:
@@ -2222,7 +2331,7 @@ components:
       - total
       - limit
       - offset
-      title: Page[AuditEventOut]
+      title: Page[AuditLogOut]
     Page_UserOut_:
       properties:
         items:

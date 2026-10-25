@@ -18,6 +18,7 @@ def benefit_type_out(doc: dict) -> dict:
     return {
         "code": doc["_id"],
         "form_no": doc.get("form_no"),
+        "priority": doc.get("priority", doc.get("form_no") or 100),
         "title": doc["title"],
         "requires": doc.get("requires", []),
         "manual_flags": doc.get("manual_flags", []),
@@ -59,8 +60,9 @@ def application_out(doc: dict, staff: bool = False) -> dict:
         "schema_version": doc["schema_version"],
         "period": doc["period"],
         "basis": doc["basis"],
-        "student": doc["student"],
-        "payout": doc["payout"],
+        # Хэши паспорта и счёта нужны только для поиска дублей, наружу не отдаются
+        "student": {k: v for k, v in doc["student"].items() if k != "passport_hash"},
+        "payout": {k: v for k, v in doc["payout"].items() if k != "account_number_hash"},
         "form": doc["form"],
         "attachments": [attachment_out(a, staff) for a in doc.get("attachments", [])],
         "status": doc["status"],
@@ -69,7 +71,10 @@ def application_out(doc: dict, staff: bool = False) -> dict:
     }
     if doc.get("rejection_reason") and doc["status"] == AppStatus.rejected:
         out["rejection_reason"] = doc["rejection_reason"]
+    if doc.get("submitted_at"):
+        out["submitted_at"] = doc["submitted_at"]
     if staff:
+        out["priority"] = doc.get("priority")
         out["checks"] = doc.get("checks", [])
         out["ocr"] = ocr_out(doc)
     return out
@@ -90,8 +95,11 @@ def application_summary(doc: dict, staff: bool = False) -> dict:
     }
     if doc.get("rejection_reason") and doc["status"] == AppStatus.rejected:
         out["rejection_reason"] = doc["rejection_reason"]
+    if doc.get("submitted_at"):
+        out["submitted_at"] = doc["submitted_at"]
     if staff:
         ocr = ocr_out(doc)
+        out["priority"] = doc.get("priority")
         out["ocr_state"] = ocr.get("state", OcrState.not_started)
         out["ocr_accuracy"] = ocr.get("accuracy")
     return out
@@ -100,7 +108,7 @@ def application_summary(doc: dict, staff: bool = False) -> dict:
 # Поля, нужные для списков: не тащим из БД вложения, проверки и историю.
 SUMMARY_PROJECTION = {
     "basis": 1, "period": 1, "status": 1, "rejection_reason": 1, "ocr.state": 1, "ocr.accuracy": 1,
-    "created_at": 1, "updated_at": 1,
+    "priority": 1, "submitted_at": 1, "created_at": 1, "updated_at": 1,
     "student.full_name": 1, "student.institute": 1, "student.group": 1,
 }
 
@@ -119,12 +127,10 @@ def status_out(doc: dict, staff: bool = False) -> dict:
 def audit_out(doc: dict) -> dict:
     return {
         "id": str(doc["_id"]),
-        "at": doc["at"],
-        "actor_id": str(doc["actor_id"]),
-        "actor_email": doc["actor_email"],
-        "actor_role": doc["actor_role"],
-        "action": doc["action"],
-        "target_type": doc["target_type"],
-        "target_id": doc["target_id"],
+        "eventType": doc["eventType"],
+        "actor": doc["actor"],
+        "resource": doc["resource"],
+        "timestamp": doc["timestamp"],
         "details": doc.get("details", {}),
+        "request_id": doc.get("request_id"),
     }

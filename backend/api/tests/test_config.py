@@ -12,6 +12,7 @@ def env(monkeypatch):
     for key in ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("JWT_SECRET", "x" * 32)
+    monkeypatch.setenv("HASH_PEPPER", "p" * 16)
     monkeypatch.setenv("S3_ACCESS_KEY", "key")
     monkeypatch.setenv("S3_SECRET_KEY", "secret")
     return monkeypatch
@@ -75,3 +76,25 @@ def test_empty_variables_are_treated_as_unset(env):
     s = Settings()
     assert s.email_backend is None and s.smtp_starttls is None and s.smtp_user is None
     assert s.s3_public_endpoint_url is None and s.admin_email is None
+
+
+def test_replica_set_name_is_added_to_the_assembled_uri(env):
+    env.setenv("MONGO_APP_USER", "sppo_app")
+    env.setenv("MONGO_APP_PASSWORD", "pw")
+    env.setenv("REDIS_PASSWORD", "r")
+    assert "replicaSet" not in Settings().mongo_dsn
+    env.setenv("MONGO_REPLICA_SET", "rs0")
+    assert Settings().mongo_dsn.endswith("authSource=sppo&replicaSet=rs0")
+    env.setenv("MONGO_URI", "mongodb+srv://u:p@cluster0.x.mongodb.net/")  # готовая строка (Atlas) не меняется
+    assert Settings().mongo_dsn == "mongodb+srv://u:p@cluster0.x.mongodb.net/"
+
+
+def test_hash_pepper_is_required_and_long_enough(env):
+    env.setenv("MONGO_URI", "mongodb://x")
+    env.setenv("REDIS_URL", "redis://r")
+    env.setenv("HASH_PEPPER", "short")
+    with pytest.raises(ValidationError, match="hash_pepper"):
+        Settings()
+    env.delenv("HASH_PEPPER")
+    with pytest.raises(ValidationError, match="hash_pepper"):
+        Settings()

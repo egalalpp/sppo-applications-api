@@ -83,3 +83,24 @@ def test_rejection_reason_is_shown_to_student_only_when_rejected():
     assert "rejection_reason" not in application_out(doc("pending"))
     assert application_out(doc("rejected"))["rejection_reason"] == "Причина"
     assert status_out(doc("rejected"))["rejection_reason"] == "Причина"
+
+
+def test_hashes_and_priority_are_never_shown_to_the_student():
+    d = doc()
+    d["priority"] = 10
+    d["student"]["passport_hash"] = "a" * 64
+    d["payout"]["account_number_hash"] = "b" * 64
+    for out in (application_out(d), application_summary(d)):
+        text = json.dumps(out, default=str)
+        assert "passport_hash" not in text and "account_number_hash" not in text and "priority" not in text
+
+    staff = application_out(d, staff=True)
+    assert staff["priority"] == 10
+    assert "passport_hash" not in staff["student"] and "account_number_hash" not in staff["payout"]
+    assert application_summary(d, staff=True)["priority"] == 10
+
+
+def test_submitted_at_is_visible_to_everyone():
+    d = doc()
+    d["submitted_at"] = NOW
+    assert application_out(d)["submitted_at"] == NOW and application_summary(d)["submitted_at"] == NOW
